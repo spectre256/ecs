@@ -11,6 +11,11 @@ const Velocity = struct {
     dy: f32,
 };
 
+const Arch = struct {
+    pos: Position,
+    vel: Velocity,
+};
+
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -19,29 +24,47 @@ pub fn main() !void {
     var ecs: World = .init(alloc);
     defer ecs.deinit();
 
+    // const d1: struct { u8, u16 } = undefined;
+    // const d1 = .{ @as(u8, 1), @as(u16, 2) };
+    // std.debug.print("size: {}, type: {s}\n", .{ @sizeOf(@TypeOf(d1)), @typeName(@TypeOf(d1)) });
+
     // const player = try ecs.new();
     // player.addComponent(Position{ .x = 0, .y = 5 });
     // player.addComponent(Velocity{ .dx = 1, .dy = 2 });
-    const player = try ecs.add(.{
-        Position{ .x = 0, .y = 5 },
-        Velocity{ .dx = 1, .dy = 2 },
+    const player = try ecs.create(&Arch{
+        .pos = Position{ .x = 0, .y = 5 },
+        .vel = Velocity{ .dx = 1, .dy = 2 },
     });
+    std.debug.print("Player has data {any}\n", .{ecs.get(struct { Position, Velocity }, player)});
     std.debug.print("Added player, id {}\n", .{player});
-    const empty1 = try ecs.new();
-    const empty2 = try ecs.new();
-    std.debug.print("Added empties, ids {} and {}\n", .{ empty1, empty2 });
+    const data = .{ @as(u8, 1), @as(u16, 2) };
+    const e1 = try ecs.create(&data);
+    const e2 = try ecs.create(&data);
+    std.debug.print("Added empties, ids {} and {}\n", .{ e1, e2 });
+    std.debug.print("Player has data {any}\n", .{ecs.get(struct { Position, Velocity }, player)});
 
     for (0..3) |_| {
-        movement(&ecs);
+        // movement(&ecs);
+        ecs.each(T, movement);
     }
+
+    ecs.delete(player);
 }
 
-pub fn movement(ecs: *World) void {
-    var query = ecs.all(struct { pos: Position, vel: Velocity });
-    while (query.next()) |e| {
-        e.pos.x += e.vel.dx;
-        e.pos.y += e.vel.dy;
-        std.debug.print("Entity {} now at ({}, {})\n", .{ e, e.pos.x, e.pos.y });
-    }
-    std.debug.print("Done moving entities\n", .{});
+const T = struct { pos: Position, vel: Velocity };
+
+fn movement(e: *T) void {
+    e.pos.x += e.vel.dx;
+    e.pos.y += e.vel.dy;
+    std.debug.print("Entity {} now at ({}, {})\n", .{ e, e.pos.x, e.pos.y });
 }
+
+// pub fn movement(ecs: *World) void {
+//     var query = ecs.all(struct { pos: Position, vel: Velocity });
+//     while (query.next()) |e| {
+//         e.pos.x += e.vel.dx;
+//         e.pos.y += e.vel.dy;
+//         std.debug.print("Entity {} now at ({}, {})\n", .{ e, e.pos.x, e.pos.y });
+//     }
+//     std.debug.print("Done moving entities\n", .{});
+// }
