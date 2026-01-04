@@ -37,6 +37,11 @@ pub fn main() !void {
     });
     std.debug.print("Player has data {any}\n", .{ecs.get(struct { Position, Velocity }, player)});
     std.debug.print("Added player, id {}\n", .{player});
+    std.debug.print("Player's velocity: {any}, position: {any}, bogus: {any}\n", .{
+        ecs.getComp(player, Velocity),
+        ecs.getComp(player, Position),
+        ecs.getComp(player, u16),
+    });
     const data = .{ @as(u8, 1), @as(u16, 2) };
     const e1 = try ecs.create(&data);
     const e2 = try ecs.create(&data);

@@ -7,7 +7,7 @@ const Child = std.meta.Child;
 const assert = std.debug.assert;
 const typeId = @import("typeid.zig").typeId;
 
-pub const num_comps = 64;
+pub const num_comps: usize = 64;
 pub var type_infos: [num_comps]struct {
     size: usize,
     alignment: Alignment,
@@ -26,6 +26,17 @@ fn maskFromType(T: type) Mask {
         };
     }
     return mask;
+}
+
+fn sizeFromMask(mask: Mask, maybe_end: ?usize) usize {
+    var total: usize = 0;
+    const end = maybe_end orelse num_comps;
+    for (type_infos[0..end], 0..end) |info, i| {
+        if (mask.isSet(i)) {
+            total = info.alignment.forward(total) + info.size;
+        }
+    }
+    return total;
 }
 
 pub const Archetype = struct {
@@ -52,15 +63,7 @@ pub const Archetype = struct {
             alignment = alignment.max(old.alignment);
         }
 
-        const stride: u16 = blk: {
-            var total: usize = 0;
-            for (type_infos, 0..) |info, i| {
-                if (mask.isSet(i)) {
-                    total = info.alignment.forward(total) + info.size;
-                }
-            }
-            break :blk @intCast(total);
-        };
+        const stride: u16 = @intCast(sizeFromMask(mask, null));
         assert(stride > 0);
 
         return .{
@@ -78,7 +81,15 @@ pub const Archetype = struct {
     }
 
     pub fn has(self: *const @This(), T: type) bool {
-        return self.mask.supersetOf(maskFromType(T));
+        return self.mask.isSet(typeId(T));
+    }
+
+    pub fn hasAll(self: *const @This(), Row: type) bool {
+        return self.mask.eql(maskFromType(Row));
+    }
+
+    pub fn hasAny(self: *const @This(), Row: type) bool {
+        return self.mask.supersetOf(maskFromType(Row));
     }
 
     pub fn getBytes(self: *const @This(), i: u32) []u8 {
@@ -87,6 +98,13 @@ pub const Archetype = struct {
 
     pub fn get(self: *const @This(), Row: type, i: u32) *Row {
         return @ptrCast(@alignCast(self.getBytes(i)));
+    }
+
+    pub fn getComp(self: *const @This(), i: u32, T: type) *T {
+        const row = self.getBytes(i);
+        const size = sizeFromMask(self.mask, typeId(T));
+        const comp = row[size..][0..@sizeOf(T)];
+        return @ptrCast(@alignCast(comp));
     }
 
     pub fn values(self: *const @This(), T: type) []T {
@@ -197,14 +215,22 @@ pub fn get(self: *const Self, Row: type, id: EntityID) *Row {
     return entry.archetype.get(Row, entry.row);
 }
 
+pub fn getComp(self: *const Self, id: EntityID, T: type) ?*T {
+    const entry = self.entries.items[id];
+    const arch = entry.archetype;
+    if (!arch.has(struct {T})) return null;
+    return arch.getComp(entry.row, T);
+}
+
 pub fn has(self: *const Self, id: EntityID, T: type) bool {
-    return self.entries.items[id].has(T);
+    return self.entries.items[id].archetype.has(T);
 }
 
 pub fn add(self: *Self, id: EntityID, comp: anytype) !void {
-    _ = self;
-    _ = id;
-    _ = comp;
+    const T = Child(@TypeOf(comp));
+    _ = T;
+
+    self.delete(id);
 }
 
 pub fn remove(self: *Self, id: EntityID, T: type) !void {

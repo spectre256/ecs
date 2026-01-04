@@ -52,6 +52,7 @@ test "generic types" {
 }
 
 test "anonymous types" {
+    try expect(typeId(struct {}) != typeId(struct {}));
     try expect(typeId(struct { field: []const u8 }) != typeId(struct { field: []const u8 }));
     try expect(typeId(struct { field1: []const u8 }) != typeId(struct { field2: []const u8 }));
 }
