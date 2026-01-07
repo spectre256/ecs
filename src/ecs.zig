@@ -28,6 +28,16 @@ fn maskFromType(T: type) Mask {
     return mask;
 }
 
+fn ensureInorder(T: type) bool {
+    var last_id: ?usize = null;
+    inline for (std.meta.fields(T)) |field| {
+        if (last_id) |id|
+            if (typeId(field.type) <= id) return false;
+
+        last_id = typeId(field.type);
+    } else return true;
+}
+
 fn sizeFromMask(mask: Mask, maybe_end: ?usize) usize {
     var total: usize = 0;
     const end = maybe_end orelse num_comps;
@@ -37,6 +47,23 @@ fn sizeFromMask(mask: Mask, maybe_end: ?usize) usize {
         }
     }
     return total;
+}
+
+fn PtrsTo(Row: type) type {
+    const old_fields = std.meta.fields(Row);
+    var new_fields: [old_fields.len]std.builtin.Type.StructField = undefined;
+    @memcpy(&new_fields, old_fields);
+    for (&new_fields) |*field| {
+        field.type = *field.type;
+        field.default_value_ptr = null;
+        field.alignment = @alignOf(*field.type);
+    }
+    return @Type(.{ .@"struct" = .{
+        .layout = .auto,
+        .fields = &new_fields,
+        .decls = &.{},
+        .is_tuple = false,
+    } });
 }
 
 pub const Archetype = struct {
@@ -84,11 +111,11 @@ pub const Archetype = struct {
         return self.mask.isSet(typeId(T));
     }
 
-    pub fn hasAll(self: *const @This(), Row: type) bool {
+    pub fn hasExact(self: *const @This(), Row: type) bool {
         return self.mask.eql(maskFromType(Row));
     }
 
-    pub fn hasAny(self: *const @This(), Row: type) bool {
+    pub fn hasAll(self: *const @This(), Row: type) bool {
         return self.mask.supersetOf(maskFromType(Row));
     }
 
@@ -96,14 +123,36 @@ pub const Archetype = struct {
         return self.buffer[i * self.stride ..][0..self.stride];
     }
 
-    pub fn get(self: *const @This(), Row: type, i: u32) *Row {
+    pub fn getOnly(self: *const @This(), Row: type, i: u32) *Row {
+        assert(ensureInorder(Row));
+        assert(self.hasExact(Row));
+
         return @ptrCast(@alignCast(self.getBytes(i)));
     }
 
+    pub fn getAll(self: *const @This(), Row: type, i: u32) PtrsTo(Row) {
+        assert(self.hasAll(Row));
+
+        var res: PtrsTo(Row) = undefined;
+        var offset: usize = 0;
+        var iter = maskFromType(Row).iterator(.{});
+
+        inline for (std.meta.fields(Row)) |field| {
+            const info = type_infos[iter.next().?];
+            offset = info.alignment.forward(offset) + info.size;
+            const byte_i = i * self.stride;
+            const ptr = &self.buffer[offset + byte_i];
+            @field(res, field.name) = @ptrCast(@alignCast(ptr));
+        }
+        return res;
+    }
+
     pub fn getComp(self: *const @This(), i: u32, T: type) *T {
+        assert(self.has(T));
+
         const row = self.getBytes(i);
-        const size = sizeFromMask(self.mask, typeId(T));
-        const comp = row[size..][0..@sizeOf(T)];
+        const offset = sizeFromMask(self.mask, typeId(T));
+        const comp = &row[offset];
         return @ptrCast(@alignCast(comp));
     }
 
@@ -134,25 +183,27 @@ pub const Archetype = struct {
 
     pub fn create(self: *@This(), alloc: Allocator, row: anytype) !u32 {
         const Row = Child(@TypeOf(row));
-        assert(maskFromType(Row).eql(self.mask));
+        assert(ensureInorder(Row));
+        assert(self.hasExact(Row));
 
         if (self.len >= self.capacity) {
             const size = @max(init_size, self.capacity * growth_factor);
             try self.resize(alloc, size);
         }
 
-        self.get(Row, self.len).* = row.*;
+        self.getOnly(Row, self.len).* = row.*;
         defer self.len += 1;
         return self.len;
     }
 
-    /// Swaps item to remove with last element amd
+    /// Swaps item to remove with last element and
     /// returns index of swapped element.
     pub fn delete(self: *@This(), i: u32) u32 {
         const len = self.len - 1;
         self.len = len;
         if (i != len)
             @memcpy(self.getBytes(i), self.getBytes(len));
+        @memset(self.getBytes(len), undefined);
         return len;
     }
 };
@@ -210,15 +261,20 @@ pub fn delete(self: *Self, id: EntityID) void {
     _ = i;
 }
 
-pub fn get(self: *const Self, Row: type, id: EntityID) *Row {
+pub fn getOnly(self: *const Self, Row: type, id: EntityID) *Row {
     const entry = self.entries.items[id];
-    return entry.archetype.get(Row, entry.row);
+    return entry.archetype.getOnly(Row, entry.row);
+}
+
+pub fn getAll(self: *const Self, Row: type, id: EntityID) PtrsTo(Row) {
+    const entry = self.entries.items[id];
+    return entry.archetype.getAll(Row, entry.row);
 }
 
 pub fn getComp(self: *const Self, id: EntityID, T: type) ?*T {
     const entry = self.entries.items[id];
     const arch = entry.archetype;
-    if (!arch.has(struct {T})) return null;
+    if (!arch.has(T)) return null;
     return arch.getComp(entry.row, T);
 }
 
@@ -280,9 +336,9 @@ pub fn Iterator(T: type, iter_all: bool) type {
 
         fn match(arch: *const Archetype) bool {
             if (iter_all) {
-                return arch.has(T);
+                return arch.hasAll(T);
             } else {
-                return arch.mask.eql(maskFromType(T));
+                return arch.hasExact(T);
             }
         }
     };
@@ -296,7 +352,7 @@ pub fn each(self: *Self, T: type, f: fn (*T) void) void {
     for (self.archetypes.values()) |*arch| {
         // TODO: Properly handle getting a subset of a row
         // if (arch.has(T)) {
-        if (arch.mask.eql(maskFromType(T))) {
+        if (arch.hasExact(T)) {
             for (arch.values(T)) |*row| {
                 f(row);
             }

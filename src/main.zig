@@ -35,7 +35,7 @@ pub fn main() !void {
         .pos = Position{ .x = 0, .y = 5 },
         .vel = Velocity{ .dx = 1, .dy = 2 },
     });
-    std.debug.print("Player has data {any}\n", .{ecs.get(struct { Position, Velocity }, player)});
+    std.debug.print("Player has data {any}\n", .{ecs.getOnly(struct { Position, Velocity }, player)});
     std.debug.print("Added player, id {}\n", .{player});
     std.debug.print("Player's velocity: {any}, position: {any}, bogus: {any}\n", .{
         ecs.getComp(player, Velocity),
@@ -46,7 +46,7 @@ pub fn main() !void {
     const e1 = try ecs.create(&data);
     const e2 = try ecs.create(&data);
     std.debug.print("Added empties, ids {} and {}\n", .{ e1, e2 });
-    std.debug.print("Player has data {any}\n", .{ecs.get(struct { Position, Velocity }, player)});
+    std.debug.print("Player has data {any}\n", .{ecs.getAll(struct { Position, Velocity }, player)});
 
     for (0..3) |_| {
         // movement(&ecs);
