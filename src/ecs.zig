@@ -13,7 +13,6 @@ pub var type_infos: [num_comps]struct {
     alignment: Alignment,
 } = undefined;
 pub const Mask = std.StaticBitSet(num_comps);
-pub const EntityID = u32;
 
 fn maskFromType(T: type) Mask {
     var mask: Mask = .initEmpty();
@@ -67,7 +66,11 @@ fn PtrsTo(Row: type) type {
 }
 
 pub const Archetype = struct {
+    /// Raw component storage
     buffer: [*]u8,
+    /// Map from row index to entity entry index.
+    /// Necessary for deletion
+    ids: List(u32),
     mask: Mask,
     len: u32,
     capacity: u32,
@@ -77,11 +80,11 @@ pub const Archetype = struct {
     const init_size = 8;
     const growth_factor = 2;
 
-    pub fn init(Row: type) @This() {
-        return .initFrom(null, Row);
+    pub fn init(self: *@This(), Row: type) void {
+        return self.initFrom(null, Row);
     }
 
-    pub fn initFrom(maybe_old: ?*Archetype, T: type) @This() {
+    pub fn initFrom(self: *@This(), maybe_old: ?*Archetype, T: type) void {
         var mask = maskFromType(T);
         var alignment: Alignment = .of(T);
 
@@ -93,18 +96,20 @@ pub const Archetype = struct {
         const stride: u16 = @intCast(sizeFromMask(mask, null));
         assert(stride > 0);
 
-        return .{
-            .mask = mask,
+        self.* = .{
             .buffer = &.{},
+            .ids = .empty,
+            .mask = mask,
             .len = 0,
             .capacity = 0,
-            .alignment = alignment,
             .stride = stride,
+            .alignment = alignment,
         };
     }
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.rawFree(self.buffer[0 .. self.capacity * self.stride], self.alignment, @returnAddress());
+        self.ids.deinit(alloc);
     }
 
     pub fn has(self: *const @This(), T: type) bool {
@@ -139,7 +144,9 @@ pub const Archetype = struct {
 
         inline for (std.meta.fields(Row)) |field| {
             const info = type_infos[iter.next().?];
-            offset = info.alignment.forward(offset) + info.size;
+            offset = info.alignment.forward(offset);
+            defer offset += info.size;
+
             const byte_i = i * self.stride;
             const ptr = &self.buffer[offset + byte_i];
             @field(res, field.name) = @ptrCast(@alignCast(ptr));
@@ -181,7 +188,7 @@ pub const Archetype = struct {
         self.buffer = new_buf;
     }
 
-    pub fn create(self: *@This(), alloc: Allocator, row: anytype) !u32 {
+    pub fn create(self: *@This(), alloc: Allocator, row: anytype, entry: u32) !u32 {
         const Row = Child(@TypeOf(row));
         assert(ensureInorder(Row));
         assert(self.hasExact(Row));
@@ -191,32 +198,54 @@ pub const Archetype = struct {
             try self.resize(alloc, size);
         }
 
+        try self.ids.append(alloc, entry);
         self.getOnly(Row, self.len).* = row.*;
+
         defer self.len += 1;
         return self.len;
     }
 
-    /// Swaps item to remove with last element and
-    /// returns index of swapped element.
+    /// Swaps item to remove with last element amd
+    /// returns entry index of swapped element.
     pub fn delete(self: *@This(), i: u32) u32 {
         const len = self.len - 1;
         self.len = len;
-        if (i != len)
+        const id = self.ids.items[i];
+        if (i != len) {
+            @branchHint(.likely);
             @memcpy(self.getBytes(i), self.getBytes(len));
-        @memset(self.getBytes(len), undefined);
-        return len;
+            self.ids.items[i] = self.ids.items[len];
+        }
+
+        if (len > 0) {
+            @memset(self.getBytes(len), undefined);
+            self.ids.shrinkRetainingCapacity(len);
+            self.ids.items[len] = undefined;
+        }
+        return id;
     }
 };
 
+pub const Error = error {
+    EntityDead,
+};
+
+pub const EntityID = packed struct {
+    gen: u32,
+    row: u32,
+};
+
 pub const EntityEntry = struct {
-    archetype: *Archetype,
+    archetype: u32,
+    gen: u32,
     row: u32,
 };
 
 archetypes: Map(Mask, Archetype),
 entries: List(EntityEntry),
-counter: EntityID,
 alloc: Allocator,
+/// Index of the head of free entries, if there is one
+free_entry: ?u32,
 
 const Self = @This();
 
@@ -224,8 +253,8 @@ pub fn init(alloc: Allocator) Self {
     return .{
         .archetypes = .empty,
         .entries = .empty,
-        .counter = 0,
         .alloc = alloc,
+        .free_entry = null,
     };
 }
 
@@ -237,49 +266,89 @@ pub fn deinit(self: *Self) void {
 }
 
 pub fn create(self: *Self, row: anytype) !EntityID {
-    const arch = try self.getArch(Child(@TypeOf(row)));
-    const row_i = try arch.create(self.alloc, row);
+    const res = try self.getArch(Child(@TypeOf(row)));
+    const arch = res.value_ptr;
+    const arch_i: u32 = @intCast(res.index);
+    const row_i = try arch.create(self.alloc, row, undefined);
     errdefer _ = arch.delete(row_i);
-    try self.entries.append(self.alloc, .{
-        .archetype = arch,
-        .row = row_i,
-    });
-    defer self.counter += 1;
-    return self.counter;
+
+    // Reuse deleted entry if possible
+    if (self.free_entry) |entry_i| {
+        arch.ids.items[row_i] = entry_i;
+        const entry = &self.entries.items[entry_i];
+
+        // Set to next free entry
+        self.free_entry = if (entry.row != entry_i) entry.row else null;
+
+        entry.archetype = arch_i;
+        entry.gen +%= 1;
+        entry.row = row_i;
+
+        return .{ .gen = entry.gen, .row = entry_i };
+    } else {
+        // No free entries, allocate a new one
+        const entry_i: u32 = @intCast(self.entries.items.len);
+        try self.entries.append(self.alloc, .{
+            .archetype = arch_i,
+            .gen = 0,
+            .row = row_i,
+        });
+        arch.ids.items[row_i] = entry_i;
+
+        return .{ .gen = 0, .row = entry_i };
+    }
 }
 
-fn getArch(self: *Self, Row: type) !*Archetype {
+fn getArch(self: *Self, Row: type) !Map(Mask, Archetype).GetOrPutResult {
     const mask = maskFromType(Row);
-    const res = try self.archetypes.getOrPutValue(self.alloc, mask, .init(Row));
-    return res.value_ptr;
+    const res = try self.archetypes.getOrPut(self.alloc, mask);
+    if (!res.found_existing) res.value_ptr.init(Row);
+    return res;
 }
 
 pub fn delete(self: *Self, id: EntityID) void {
-    const entry = self.entries.items[id];
-    const i = entry.archetype.delete(entry.row);
-    // TODO: Delete entry
-    _ = i;
+    const entry = &self.entries.items[id.row];
+    const arch = &self.archetypes.values()[entry.archetype];
+    const i = arch.delete(entry.row);
+
+    // Update moved entry
+    self.entries.items[i].row = id.row;
+
+    // Prepend free entry
+    entry.row = self.free_entry orelse entry.row;
+    self.free_entry = entry.row;
 }
 
-pub fn getOnly(self: *const Self, Row: type, id: EntityID) *Row {
-    const entry = self.entries.items[id];
-    return entry.archetype.getOnly(Row, entry.row);
+pub fn alive(self: *const Self, id: EntityID) bool {
+    return id.gen == self.entries.items[id.row].gen;
 }
 
-pub fn getAll(self: *const Self, Row: type, id: EntityID) PtrsTo(Row) {
-    const entry = self.entries.items[id];
-    return entry.archetype.getAll(Row, entry.row);
+pub fn getOnly(self: *const Self, Row: type, id: EntityID) Error!*Row {
+    const entry = self.entries.items[id.row];
+    if (entry.gen != id.gen) return error.EntityDead;
+    const arch = &self.archetypes.values()[entry.archetype];
+    return arch.getOnly(Row, entry.row);
+}
+
+pub fn getAll(self: *const Self, Row: type, id: EntityID) Error!PtrsTo(Row) {
+    const entry = self.entries.items[id.row];
+    if (entry.gen != id.gen) return error.EntityDead;
+    const arch = &self.archetypes.values()[entry.archetype];
+    return arch.getAll(Row, entry.row);
 }
 
 pub fn getComp(self: *const Self, id: EntityID, T: type) ?*T {
-    const entry = self.entries.items[id];
-    const arch = entry.archetype;
+    const entry = self.entries.items[id.row];
+    if (entry.gen != id.gen) return null;
+    const arch = &self.archetypes.values()[entry.archetype];
     if (!arch.has(T)) return null;
     return arch.getComp(entry.row, T);
 }
 
 pub fn has(self: *const Self, id: EntityID, T: type) bool {
-    return self.entries.items[id].archetype.has(T);
+    const entry = self.entries.items[id.row];
+    const arch = &self.archetypes.values()[entry.archetype];
+    return arch.has(T);
 }
 
 pub fn add(self: *Self, id: EntityID, comp: anytype) !void {
@@ -350,8 +419,6 @@ pub fn all(self: *Self, Row: type) Iterator(Row, true) {
 
 pub fn each(self: *Self, T: type, f: fn (*T) void) void {
     for (self.archetypes.values()) |*arch| {
-        // TODO: Properly handle getting a subset of a row
-        // if (arch.has(T)) {
         if (arch.hasExact(T)) {
             for (arch.values(T)) |*row| {
                 f(row);

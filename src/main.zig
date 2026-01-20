@@ -28,15 +28,12 @@ pub fn main() !void {
     // const d1 = .{ @as(u8, 1), @as(u16, 2) };
     // std.debug.print("size: {}, type: {s}\n", .{ @sizeOf(@TypeOf(d1)), @typeName(@TypeOf(d1)) });
 
-    // const player = try ecs.new();
-    // player.addComponent(Position{ .x = 0, .y = 5 });
-    // player.addComponent(Velocity{ .dx = 1, .dy = 2 });
     const player = try ecs.create(&Arch{
         .pos = Position{ .x = 0, .y = 5 },
         .vel = Velocity{ .dx = 1, .dy = 2 },
     });
-    std.debug.print("Player has data {any}\n", .{ecs.getOnly(struct { Position, Velocity }, player)});
     std.debug.print("Added player, id {}\n", .{player});
+    std.debug.print("Player has data {any}\n", .{ecs.getOnly(struct { Position, Velocity }, player)});
     std.debug.print("Player's velocity: {any}, position: {any}, bogus: {any}\n", .{
         ecs.getComp(player, Velocity),
         ecs.getComp(player, Position),
@@ -45,11 +42,10 @@ pub fn main() !void {
     const data = .{ @as(u8, 1), @as(u16, 2) };
     const e1 = try ecs.create(&data);
     const e2 = try ecs.create(&data);
-    std.debug.print("Added empties, ids {} and {}\n", .{ e1, e2 });
     std.debug.print("Player has data {any}\n", .{ecs.getAll(struct { Position, Velocity }, player)});
+    std.debug.print("Added other entities, ids {} and {}\n", .{ e1, e2 });
 
     for (0..3) |_| {
-        // movement(&ecs);
         ecs.each(T, movement);
     }
 
