@@ -14,15 +14,19 @@ pub var type_infos: [num_comps]struct {
 } = undefined;
 pub const Mask = std.StaticBitSet(num_comps);
 
-fn maskFromType(T: type) Mask {
+fn registerType(T: type) void {
+    type_infos[typeId(T)] = .{
+        .size = @sizeOf(T),
+        .alignment = .of(T),
+    };
+}
+
+fn maskFromType(Row: type) Mask {
     var mask: Mask = .initEmpty();
-    inline for (std.meta.fields(T)) |field| {
+    inline for (std.meta.fields(Row)) |field| {
         const id = typeId(field.type);
         mask.set(id);
-        type_infos[id] = .{
-            .size = @sizeOf(field.type),
-            .alignment = .of(field.type),
-        };
+        registerType(field.type);
     }
     return mask;
 }
@@ -40,12 +44,20 @@ fn ensureInorder(T: type) bool {
 fn sizeFromMask(mask: Mask, maybe_end: ?usize) usize {
     var total: usize = 0;
     const end = maybe_end orelse num_comps;
-    for (type_infos[0..end], 0..end) |info, i| {
-        if (mask.isSet(i)) {
-            total = info.alignment.forward(total) + info.size;
-        }
+    var iter = mask.iterator(.{});
+    while (iter.next()) |i| {
+        if (i >= end) break;
+        const info = type_infos[i];
+        total = info.alignment.forward(total) + info.size;
     }
     return total;
+}
+
+fn alignFromMask(mask: Mask) Alignment {
+    var res: Alignment = .@"1";
+    var iter = mask.iterator(.{});
+    while (iter.next()) |i| res = res.max(type_infos[i].alignment);
+    return res;
 }
 
 fn PtrsTo(Row: type) type {
@@ -80,19 +92,8 @@ pub const Archetype = struct {
     const init_size = 8;
     const growth_factor = 2;
 
-    pub fn init(self: *@This(), Row: type) void {
-        return self.initFrom(null, Row);
-    }
-
-    pub fn initFrom(self: *@This(), maybe_old: ?*Archetype, T: type) void {
-        var mask = maskFromType(T);
-        var alignment: Alignment = .of(T);
-
-        if (maybe_old) |old| {
-            mask = mask.unionWith(old.mask);
-            alignment = alignment.max(old.alignment);
-        }
-
+    pub fn init(self: *@This(), mask: Mask) void {
+        const alignment = alignFromMask(mask);
         const stride: u16 = @intCast(sizeFromMask(mask, null));
         assert(stride > 0);
 
@@ -139,18 +140,21 @@ pub const Archetype = struct {
         assert(self.hasAll(Row));
 
         var res: PtrsTo(Row) = undefined;
-        var offset: usize = 0;
+        var offset: usize = i * self.stride;
         var iter = maskFromType(Row).iterator(.{});
 
+        // FIXME: This doesn't work. Have to add offsets for all comps in
+        // current mask and fill out field if requested. Perhaps simpler if
+        // we restrict Row to inorder? But that would make it annoying to use.
         inline for (std.meta.fields(Row)) |field| {
             const info = type_infos[iter.next().?];
             offset = info.alignment.forward(offset);
             defer offset += info.size;
 
-            const byte_i = i * self.stride;
-            const ptr = &self.buffer[offset + byte_i];
+            const ptr = &self.buffer[offset];
             @field(res, field.name) = @ptrCast(@alignCast(ptr));
         }
+
         return res;
     }
 
@@ -163,8 +167,8 @@ pub const Archetype = struct {
         return @ptrCast(@alignCast(comp));
     }
 
-    pub fn values(self: *const @This(), T: type) []T {
-        return @as([*]T, @ptrCast(@alignCast(self.buffer)))[0..self.len];
+    pub fn values(self: *const @This(), Row: type) []Row {
+        return @as([*]Row, @ptrCast(@alignCast(self.buffer)))[0..self.len];
     }
 
     fn resize(self: *@This(), alloc: Allocator, capacity: u32) !void {
@@ -188,21 +192,65 @@ pub const Archetype = struct {
         self.buffer = new_buf;
     }
 
-    pub fn create(self: *@This(), alloc: Allocator, row: anytype, entry: u32) !u32 {
-        const Row = Child(@TypeOf(row));
-        assert(ensureInorder(Row));
-        assert(self.hasExact(Row));
-
+    pub fn new(self: *@This(), alloc: Allocator, entry: u32) !u32 {
         if (self.len >= self.capacity) {
             const size = @max(init_size, self.capacity * growth_factor);
             try self.resize(alloc, size);
         }
 
         try self.ids.append(alloc, entry);
-        self.getOnly(Row, self.len).* = row.*;
+        @memset(self.getBytes(self.len), undefined);
 
         defer self.len += 1;
         return self.len;
+    }
+
+    pub fn create(self: *@This(), alloc: Allocator, row: anytype, entry: u32) !u32 {
+        const Row = Child(@TypeOf(row));
+        assert(ensureInorder(Row));
+        assert(self.hasExact(Row));
+
+        const i = try self.new(alloc, entry);
+        self.getOnly(Row, i).* = row.*;
+        return i;
+    }
+
+    /// Copy entity from `other` at index `other_i` to `self`. Only copies
+    /// components present in `self`. Returns the new row index.
+    pub fn copy(self: *@This(), other: *const @This(), alloc: Allocator, other_i: u32) !u32 {
+        // other cannot have components that self doesn't
+        // FIXME: We actually need this for removal
+        assert(self.mask.supersetOf(other.mask));
+
+        const self_i = try self.new(alloc, other.ids.items[other_i]);
+
+        var self_offset: usize = self_i * self.stride;
+        var other_offset: usize = other_i * other.stride;
+        var iter = self.mask.iterator(.{});
+
+
+        std.debug.print("(copy) copying from {} to {}\n", .{other.mask, self.mask});
+
+        // Iterate over components in other entity
+        while (iter.next()) |i| {
+            const info = type_infos[i];
+            self_offset = info.alignment.forward(self_offset);
+            defer self_offset += info.size;
+
+            if (other.mask.isSet(i)) {
+                other_offset = info.alignment.forward(other_offset);
+                defer other_offset += info.size;
+                std.debug.print("(copy) i = {}, info = {}, other's offset = {}, self's offset = {}\n", .{i, info, other_offset, self_offset});
+
+                const other_comp = other.buffer[other_offset..][0..info.size];
+                const self_comp = self.buffer[self_offset..][0..info.size];
+                @memcpy(self_comp, other_comp);
+            } else {
+                std.debug.print("(copy) i = {}, info = {}, self's offset = {}\n", .{ i, info, self_offset });
+            }
+        }
+
+        return self_i;
     }
 
     /// Swaps item to remove with last element amd
@@ -266,7 +314,8 @@ pub fn deinit(self: *Self) void {
 }
 
 pub fn create(self: *Self, row: anytype) !EntityID {
-    const res = try self.getArch(Child(@TypeOf(row)));
+    const Row = Child(@TypeOf(row));
+    const res = try self.getArch(maskFromType(Row));
     const arch = res.value_ptr;
     const arch_i: u32 = @intCast(res.index);
     const row_i = try arch.create(self.alloc, row, undefined);
@@ -280,8 +329,8 @@ pub fn create(self: *Self, row: anytype) !EntityID {
         // Set to next free entry
         self.free_entry = if (entry.row != entry_i) entry.row else null;
 
+        // No need to update gen, this is handled during deletion
         entry.archetype = arch_i;
-        entry.gen +%= 1;
         entry.row = row_i;
 
         return .{ .gen = entry.gen, .row = entry_i };
@@ -299,15 +348,18 @@ pub fn create(self: *Self, row: anytype) !EntityID {
     }
 }
 
-fn getArch(self: *Self, Row: type) !Map(Mask, Archetype).GetOrPutResult {
-    const mask = maskFromType(Row);
+inline fn getArch(self: *Self, mask: Mask) !Map(Mask, Archetype).GetOrPutResult {
     const res = try self.archetypes.getOrPut(self.alloc, mask);
-    if (!res.found_existing) res.value_ptr.init(Row);
+    if (!res.found_existing) res.value_ptr.init(mask);
     return res;
 }
 
+// inline fn getArchAt(self: *Self, i: u32) *Archetype {}
+
 pub fn delete(self: *Self, id: EntityID) void {
     const entry = &self.entries.items[id.row];
+    // TODO: Should this be an assert?
+    if (entry.gen != id.gen) return;
     const arch = &self.archetypes.values()[entry.archetype];
     const i = arch.delete(entry.row);
 
@@ -316,6 +368,7 @@ pub fn delete(self: *Self, id: EntityID) void {
 
     // Prepend free entry
     entry.row = self.free_entry orelse entry.row;
+    entry.gen +%= 1; // Increment immediately that way subsequent checks detect that the entity was deleted
     self.free_entry = entry.row;
 }
 
@@ -347,21 +400,53 @@ pub fn getComp(self: *const Self, id: EntityID, T: type) ?*T {
 
 pub fn has(self: *const Self, id: EntityID, T: type) bool {
     const entry = self.entries.items[id.row];
+    // TODO: Should this be an assert?
+    if (entry.gen != id.gen) return false;
     const arch = &self.archetypes.values()[entry.archetype];
     return arch.has(T);
 }
 
 pub fn add(self: *Self, id: EntityID, comp: anytype) !void {
-    const T = Child(@TypeOf(comp));
-    _ = T;
+    const entry = &self.entries.items[id.row];
+    // TODO: Should this be an assert?
+    if (entry.gen != id.gen) return error.EntityDead;
+    const old_arch = &self.archetypes.values()[entry.archetype];
 
-    self.delete(id);
+    // TODO: Error if bit already set, no duplicate components
+    const T = Child(@TypeOf(comp));
+    registerType(T);
+    var new_mask = old_arch.mask;
+    new_mask.set(typeId(T));
+
+    const res = try self.getArch(new_mask);
+    const new_arch = res.value_ptr;
+    entry.archetype = @intCast(res.index);
+
+    const old_row = entry.row;
+    entry.row = try new_arch.copy(old_arch, self.alloc, old_row);
+    new_arch.getComp(entry.row, T).* = comp.*;
+
+    const i = old_arch.delete(old_row);
+    self.entries.items[i].row = old_row;
 }
 
 pub fn remove(self: *Self, id: EntityID, T: type) !void {
-    _ = self;
-    _ = id;
-    _ = T;
+    const entry = &self.entries.items[id.row];
+    // TODO: Should this be an assert?
+    if (entry.gen != id.gen) return error.EntityDead;
+    const old_arch = &self.archetypes.values()[entry.archetype];
+
+    var new_mask = old_arch.mask;
+    new_mask.unset(typeId(T));
+
+    const res = try self.getArch(new_mask);
+    entry.archetype = @intCast(res.index);
+
+    const old_row = entry.row;
+    entry.row = try res.value_ptr.copy(old_arch, self.alloc, old_row);
+
+    const i = old_arch.delete(old_row);
+    self.entries.items[i].row = old_row;
 }
 
 pub fn Iterator(T: type, iter_all: bool) type {

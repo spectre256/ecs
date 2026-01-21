@@ -11,6 +11,10 @@ const Velocity = struct {
     dy: f32,
 };
 
+const Name = struct {
+    name: []const u8,
+};
+
 const Arch = struct {
     pos: Position,
     vel: Velocity,
@@ -40,21 +44,24 @@ pub fn main() !void {
         ecs.getComp(player, u16),
     });
     const data = .{ @as(u8, 1), @as(u16, 2) };
+    std.debug.print("Player has data {any}\n", .{ecs.getAll(struct { Position, Velocity }, player)});
     const e1 = try ecs.create(&data);
     const e2 = try ecs.create(&data);
     std.debug.print("Player has data {any}\n", .{ecs.getAll(struct { Position, Velocity }, player)});
     std.debug.print("Added other entities, ids {} and {}\n", .{ e1, e2 });
+    try ecs.add(player, &Name{ .name = "Bob" });
+    std.debug.print("Player has data {any}\n", .{ecs.getAll(struct { Position, Velocity }, player)});
+    std.debug.print("Player has data {any}\n", .{ecs.getOnly(struct { Name, Position, Velocity }, player)});
+    // try ecs.remove(player, Name);
 
     for (0..3) |_| {
-        ecs.each(T, movement);
+        ecs.each(Arch, movement);
     }
 
     ecs.delete(player);
 }
 
-const T = struct { pos: Position, vel: Velocity };
-
-fn movement(e: *T) void {
+fn movement(e: *Arch) void {
     e.pos.x += e.vel.dx;
     e.pos.y += e.vel.dy;
     std.debug.print("Entity {} now at ({}, {})\n", .{ e, e.pos.x, e.pos.y });
