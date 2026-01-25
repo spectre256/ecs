@@ -52,7 +52,9 @@ pub fn main() !void {
     try ecs.add(player, &Name{ .name = "Bob" });
     std.debug.print("Player has data {any}\n", .{ecs.getAll(struct { Position, Velocity }, player)});
     std.debug.print("Player has data {any}\n", .{ecs.getOnly(struct { Name, Position, Velocity }, player)});
-    // try ecs.remove(player, Name);
+    try ecs.remove(player, Name);
+    std.debug.print("Player has data {any}\n", .{ecs.getAll(struct { Velocity }, player)});
+    std.debug.print("Player has data {any}\n", .{ecs.getOnly(struct { Position, Velocity }, player)});
 
     for (0..3) |_| {
         ecs.each(Arch, movement);

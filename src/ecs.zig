@@ -60,6 +60,25 @@ fn alignFromMask(mask: Mask) Alignment {
     return res;
 }
 
+// TODO: This won't work until typeId works at comptime
+fn Sorted(Row: type) type {
+    const Field = std.builtin.Type.StructField;
+    const old_fields = std.meta.fields(Row);
+    var new_fields: [old_fields.len]Field = undefined;
+    @memcpy(&new_fields, old_fields);
+    std.sort.insertion(Field, &new_fields, struct {
+        fn lessThan(a: Field, b: Field) bool {
+            return typeId(a.type) < typeId(b.type);
+        }
+    }.lessThan);
+    return @Type(.{ .@"struct" = .{
+        .layout = .auto,
+        .fields = &new_fields,
+        .decls = &.{},
+        .is_tuple = false,
+    } });
+}
+
 fn PtrsTo(Row: type) type {
     const old_fields = std.meta.fields(Row);
     var new_fields: [old_fields.len]std.builtin.Type.StructField = undefined;
@@ -137,17 +156,25 @@ pub const Archetype = struct {
     }
 
     pub fn getAll(self: *const @This(), Row: type, i: u32) PtrsTo(Row) {
+        // TODO: This is a temporary solution. Users shouldn't have to
+        // remember the order in which they created types. This is hard to
+        // fix until typeId can be made to work at comptime, however.
+        assert(ensureInorder(Row));
         assert(self.hasAll(Row));
 
         var res: PtrsTo(Row) = undefined;
         var offset: usize = i * self.stride;
-        var iter = maskFromType(Row).iterator(.{});
+        var iter = self.mask.iterator(.{});
 
-        // FIXME: This doesn't work. Have to add offsets for all comps in
-        // current mask and fill out field if requested. Perhaps simpler if
-        // we restrict Row to inorder? But that would make it annoying to use.
         inline for (std.meta.fields(Row)) |field| {
-            const info = type_infos[iter.next().?];
+            var info_i = iter.next().?;
+            while (info_i < typeId(field.type)) {
+                const info = type_infos[info_i];
+                info_i = iter.next() orelse break;
+                offset = info.alignment.forward(offset) + info.size;
+            }
+
+            const info = type_infos[info_i];
             offset = info.alignment.forward(offset);
             defer offset += info.size;
 
@@ -218,35 +245,33 @@ pub const Archetype = struct {
     /// Copy entity from `other` at index `other_i` to `self`. Only copies
     /// components present in `self`. Returns the new row index.
     pub fn copy(self: *@This(), other: *const @This(), alloc: Allocator, other_i: u32) !u32 {
-        // other cannot have components that self doesn't
-        // FIXME: We actually need this for removal
-        assert(self.mask.supersetOf(other.mask));
-
         const self_i = try self.new(alloc, other.ids.items[other_i]);
 
         var self_offset: usize = self_i * self.stride;
         var other_offset: usize = other_i * other.stride;
-        var iter = self.mask.iterator(.{});
-
-
-        std.debug.print("(copy) copying from {} to {}\n", .{other.mask, self.mask});
+        var self_iter = self.mask.iterator(.{});
+        var other_iter = other.mask.iterator(.{});
 
         // Iterate over components in other entity
-        while (iter.next()) |i| {
+        while (self_iter.next()) |i| {
             const info = type_infos[i];
             self_offset = info.alignment.forward(self_offset);
             defer self_offset += info.size;
 
             if (other.mask.isSet(i)) {
+                var info_i = other_iter.next().?;
+                while (info_i < i) {
+                    const other_info = type_infos[info_i];
+                    info_i = other_iter.next() orelse break;
+                    other_offset = other_info.alignment.forward(other_offset) + other_info.size;
+                }
+
                 other_offset = info.alignment.forward(other_offset);
                 defer other_offset += info.size;
-                std.debug.print("(copy) i = {}, info = {}, other's offset = {}, self's offset = {}\n", .{i, info, other_offset, self_offset});
 
                 const other_comp = other.buffer[other_offset..][0..info.size];
                 const self_comp = self.buffer[self_offset..][0..info.size];
                 @memcpy(self_comp, other_comp);
-            } else {
-                std.debug.print("(copy) i = {}, info = {}, self's offset = {}\n", .{ i, info, self_offset });
             }
         }
 
