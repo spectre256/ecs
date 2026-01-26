@@ -148,14 +148,14 @@ pub const Archetype = struct {
         return self.buffer[i * self.stride ..][0..self.stride];
     }
 
-    pub fn getOnly(self: *const @This(), Row: type, i: u32) *Row {
+    pub fn getRow(self: *const @This(), Row: type, i: u32) *Row {
         assert(ensureInorder(Row));
         assert(self.hasExact(Row));
 
         return @ptrCast(@alignCast(self.getBytes(i)));
     }
 
-    pub fn getAll(self: *const @This(), Row: type, i: u32) PtrsTo(Row) {
+    pub fn getMany(self: *const @This(), i: u32, Row: type) PtrsTo(Row) {
         // TODO: This is a temporary solution. Users shouldn't have to
         // remember the order in which they created types. This is hard to
         // fix until typeId can be made to work at comptime, however.
@@ -238,7 +238,7 @@ pub const Archetype = struct {
         assert(self.hasExact(Row));
 
         const i = try self.new(alloc, entry);
-        self.getOnly(Row, i).* = row.*;
+        self.getRow(Row, i).* = row.*;
         return i;
     }
 
@@ -401,18 +401,34 @@ pub fn alive(self: *const Self, id: EntityID) bool {
     return id.gen == self.entries.items[id.row].gen;
 }
 
-pub fn getOnly(self: *const Self, Row: type, id: EntityID) Error!*Row {
-    const entry = self.entries.items[id.row];
-    if (entry.gen != id.gen) return error.EntityDead;
-    const arch = &self.archetypes.values()[entry.archetype];
-    return arch.getOnly(Row, entry.row);
+fn GetResult(T: type) type {
+    return switch (T) {
+        []const type => PtrsTo(std.meta.Tuple(T)),
+        type => if (@typeInfo(T) == .@"struct") PtrsTo(T) else *T,
+        else => @compileError("Expected struct, slice of types, or single type; found " ++ @typeName(T)),
+    };
 }
 
-pub fn getAll(self: *const Self, Row: type, id: EntityID) Error!PtrsTo(Row) {
+pub fn get(self: *const Self, id: EntityID, T: anytype) Error!GetResult(@TypeOf(T)) {
+    return switch (@TypeOf(T)) {
+        []const type => self.getMany(id, std.meta.Tuple(T)),
+        type => if (@typeInfo(T) == .@"struct") self.getMany(id, T) else self.getComp(id, T),
+        else => unreachable,
+    };
+}
+
+pub fn getRow(self: *const Self, Row: type, id: EntityID) Error!*Row {
     const entry = self.entries.items[id.row];
     if (entry.gen != id.gen) return error.EntityDead;
     const arch = &self.archetypes.values()[entry.archetype];
-    return arch.getAll(Row, entry.row);
+    return arch.getRow(Row, entry.row);
+}
+
+pub fn getMany(self: *const Self, id: EntityID, Row: type) Error!PtrsTo(Row) {
+    const entry = self.entries.items[id.row];
+    if (entry.gen != id.gen) return error.EntityDead;
+    const arch = &self.archetypes.values()[entry.archetype];
+    return arch.getMany(entry.row, Row);
 }
 
 pub fn getComp(self: *const Self, id: EntityID, T: type) ?*T {
@@ -423,6 +439,14 @@ pub fn getComp(self: *const Self, id: EntityID, T: type) ?*T {
     return arch.getComp(entry.row, T);
 }
 
+pub fn getOrAdd(self: *Self, id: EntityID, T: type) !*T {
+    return self.getOrAddValue(id, T, undefined);
+}
+
+pub fn getOrAddValue(self: *Self, id: EntityID, T: type, default: *const T) !*T {
+    return self.getComp(id, T) orelse self.add(id, default);
+}
+
 pub fn has(self: *const Self, id: EntityID, T: type) bool {
     const entry = self.entries.items[id.row];
     // TODO: Should this be an assert?
@@ -431,16 +455,16 @@ pub fn has(self: *const Self, id: EntityID, T: type) bool {
     return arch.has(T);
 }
 
-pub fn add(self: *Self, id: EntityID, comp: anytype) !void {
+pub fn add(self: *Self, id: EntityID, comp: anytype) !*Child(@TypeOf(comp)) {
     const entry = &self.entries.items[id.row];
     // TODO: Should this be an assert?
     if (entry.gen != id.gen) return error.EntityDead;
     const old_arch = &self.archetypes.values()[entry.archetype];
 
-    // TODO: Error if bit already set, no duplicate components
     const T = Child(@TypeOf(comp));
     registerType(T);
     var new_mask = old_arch.mask;
+    if (new_mask.isSet(typeId(T))) return error.CompAlreadyAdded;
     new_mask.set(typeId(T));
 
     const res = try self.getArch(new_mask);
@@ -449,10 +473,13 @@ pub fn add(self: *Self, id: EntityID, comp: anytype) !void {
 
     const old_row = entry.row;
     entry.row = try new_arch.copy(old_arch, self.alloc, old_row);
-    new_arch.getComp(entry.row, T).* = comp.*;
+    const new_comp = new_arch.getComp(entry.row, T);
+    new_comp.* = comp.*;
 
     const i = old_arch.delete(old_row);
     self.entries.items[i].row = old_row;
+
+    return new_comp;
 }
 
 pub fn remove(self: *Self, id: EntityID, T: type) !void {

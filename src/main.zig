@@ -37,24 +37,24 @@ pub fn main() !void {
         .vel = Velocity{ .dx = 1, .dy = 2 },
     });
     std.debug.print("Added player, id {}\n", .{player});
-    std.debug.print("Player has data {any}\n", .{ecs.getOnly(struct { Position, Velocity }, player)});
+    std.debug.print("Player has data {any}\n", .{ecs.getRow(struct { Position, Velocity }, player)});
     std.debug.print("Player's velocity: {any}, position: {any}, bogus: {any}\n", .{
         ecs.getComp(player, Velocity),
         ecs.getComp(player, Position),
         ecs.getComp(player, u16),
     });
     const data = .{ @as(u8, 1), @as(u16, 2) };
-    std.debug.print("Player has data {any}\n", .{ecs.getAll(struct { Position, Velocity }, player)});
+    std.debug.print("Player has data {any}\n", .{ecs.getMany(player, struct { Position, Velocity })});
     const e1 = try ecs.create(&data);
     const e2 = try ecs.create(&data);
-    std.debug.print("Player has data {any}\n", .{ecs.getAll(struct { Position, Velocity }, player)});
+    std.debug.print("Player has data {any}\n", .{ecs.getMany(player, struct { Position, Velocity })});
     std.debug.print("Added other entities, ids {} and {}\n", .{ e1, e2 });
     try ecs.add(player, &Name{ .name = "Bob" });
-    std.debug.print("Player has data {any}\n", .{ecs.getAll(struct { Position, Velocity }, player)});
-    std.debug.print("Player has data {any}\n", .{ecs.getOnly(struct { Name, Position, Velocity }, player)});
+    std.debug.print("Player has data {any}\n", .{ecs.getMany(player, struct { Position, Velocity })});
+    std.debug.print("Player has data {any}\n", .{ecs.getRow(struct { Name, Position, Velocity }, player)});
     try ecs.remove(player, Name);
-    std.debug.print("Player has data {any}\n", .{ecs.getAll(struct { Velocity }, player)});
-    std.debug.print("Player has data {any}\n", .{ecs.getOnly(struct { Position, Velocity }, player)});
+    std.debug.print("Player has data {any}\n", .{ecs.getMany(player, struct { Velocity })});
+    std.debug.print("Player has data {any}\n", .{ecs.getRow(struct { Position, Velocity }, player)});
 
     for (0..3) |_| {
         ecs.each(Arch, movement);
