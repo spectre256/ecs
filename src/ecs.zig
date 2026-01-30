@@ -283,11 +283,11 @@ pub const Archetype = struct {
     pub fn delete(self: *@This(), i: u32) u32 {
         const len = self.len - 1;
         self.len = len;
-        const id = self.ids.items[i];
+        const id = self.ids.items[len];
         if (i != len) {
             @branchHint(.likely);
             @memcpy(self.getBytes(i), self.getBytes(len));
-            self.ids.items[i] = self.ids.items[len];
+            self.ids.items[i] = id;
         }
 
         if (len > 0) {
@@ -317,7 +317,8 @@ pub const EntityEntry = struct {
 archetypes: Map(Mask, Archetype),
 entries: List(EntityEntry),
 alloc: Allocator,
-/// Index of the head of free entries, if there is one
+/// Index of the head of free entries, if there is one. The last entry will
+/// have a `row` is the same as its index in the entry list
 free_entry: ?u32,
 
 const Self = @This();
@@ -392,7 +393,7 @@ pub fn delete(self: *Self, id: EntityID) void {
     self.entries.items[i].row = id.row;
 
     // Prepend free entry
-    entry.row = self.free_entry orelse entry.row;
+    entry.row = self.free_entry orelse id.row;
     entry.gen +%= 1; // Increment immediately that way subsequent checks detect that the entity was deleted
     self.free_entry = entry.row;
 }
@@ -455,13 +456,17 @@ pub fn has(self: *const Self, id: EntityID, T: type) bool {
     return arch.has(T);
 }
 
-pub fn add(self: *Self, id: EntityID, comp: anytype) !*Child(@TypeOf(comp)) {
+pub fn addValue(self: *Self, id: EntityID, comp: anytype) !void {
+    const ptr = try self.add(id, Child(@TypeOf(comp)));
+    ptr.* = comp.*;
+}
+
+pub fn add(self: *Self, id: EntityID, T: type) !*T {
     const entry = &self.entries.items[id.row];
     // TODO: Should this be an assert?
     if (entry.gen != id.gen) return error.EntityDead;
     const old_arch = &self.archetypes.values()[entry.archetype];
 
-    const T = Child(@TypeOf(comp));
     registerType(T);
     var new_mask = old_arch.mask;
     if (new_mask.isSet(typeId(T))) return error.CompAlreadyAdded;
@@ -473,13 +478,11 @@ pub fn add(self: *Self, id: EntityID, comp: anytype) !*Child(@TypeOf(comp)) {
 
     const old_row = entry.row;
     entry.row = try new_arch.copy(old_arch, self.alloc, old_row);
-    const new_comp = new_arch.getComp(entry.row, T);
-    new_comp.* = comp.*;
 
     const i = old_arch.delete(old_row);
     self.entries.items[i].row = old_row;
 
-    return new_comp;
+    return new_arch.getComp(entry.row, T);
 }
 
 pub fn remove(self: *Self, id: EntityID, T: type) !void {
