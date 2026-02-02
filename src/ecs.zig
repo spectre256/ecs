@@ -233,12 +233,12 @@ pub const Archetype = struct {
     }
 
     pub fn create(self: *@This(), alloc: Allocator, row: anytype, entry: u32) !u32 {
-        const Row = Child(@TypeOf(row));
+        const Row = @TypeOf(row);
         assert(ensureInorder(Row));
         assert(self.hasExact(Row));
 
         const i = try self.new(alloc, entry);
-        self.getRow(Row, i).* = row.*;
+        self.getRow(Row, i).* = row;
         return i;
     }
 
@@ -340,8 +340,7 @@ pub fn deinit(self: *Self) void {
 }
 
 pub fn create(self: *Self, row: anytype) !EntityID {
-    const Row = Child(@TypeOf(row));
-    const res = try self.getArch(maskFromType(Row));
+    const res = try self.getArch(maskFromType(@TypeOf(row)));
     const arch = res.value_ptr;
     const arch_i: u32 = @intCast(res.index);
     const row_i = try arch.create(self.alloc, row, undefined);
@@ -457,8 +456,8 @@ pub fn has(self: *const Self, id: EntityID, T: type) bool {
 }
 
 pub fn addValue(self: *Self, id: EntityID, comp: anytype) !void {
-    const ptr = try self.add(id, Child(@TypeOf(comp)));
-    ptr.* = comp.*;
+    const ptr = try self.add(id, @TypeOf(comp));
+    ptr.* = comp;
 }
 
 pub fn add(self: *Self, id: EntityID, T: type) !*T {

@@ -32,7 +32,7 @@ pub fn main() !void {
     // const d1 = .{ @as(u8, 1), @as(u16, 2) };
     // std.debug.print("size: {}, type: {s}\n", .{ @sizeOf(@TypeOf(d1)), @typeName(@TypeOf(d1)) });
 
-    const player = try ecs.create(&Arch{
+    const player = try ecs.create(Arch{
         .pos = Position{ .x = 0, .y = 5 },
         .vel = Velocity{ .dx = 1, .dy = 2 },
     });
@@ -45,11 +45,11 @@ pub fn main() !void {
     });
     const data = .{ @as(u8, 1), @as(u16, 2) };
     std.debug.print("Player has data {any}\n", .{ecs.getMany(player, struct { Position, Velocity })});
-    const e1 = try ecs.create(&data);
-    const e2 = try ecs.create(&data);
+    const e1 = try ecs.create(data);
+    const e2 = try ecs.create(data);
     std.debug.print("Player has data {any}\n", .{ecs.getMany(player, struct { Position, Velocity })});
     std.debug.print("Added other entities, ids {} and {}\n", .{ e1, e2 });
-    try ecs.add(player, &Name{ .name = "Bob" });
+    try ecs.addValue(player, Name{ .name = "Bob" });
     std.debug.print("Player has data {any}\n", .{ecs.getMany(player, struct { Position, Velocity })});
     std.debug.print("Player has data {any}\n", .{ecs.getRow(struct { Name, Position, Velocity }, player)});
     try ecs.remove(player, Name);
@@ -66,7 +66,7 @@ pub fn main() !void {
 fn movement(e: *Arch) void {
     e.pos.x += e.vel.dx;
     e.pos.y += e.vel.dy;
-    std.debug.print("Entity {} now at ({}, {})\n", .{ e, e.pos.x, e.pos.y });
+    std.debug.print("Entity {*} now at ({}, {})\n", .{ e, e.pos.x, e.pos.y });
 }
 
 // pub fn movement(ecs: *World) void {
