@@ -1,5 +1,5 @@
 const std = @import("std");
-const World = @import("ecs.zig");
+const World = @import("World.zig");
 
 const Position = struct {
     x: f32,
