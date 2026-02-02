@@ -15,16 +15,18 @@ ids: List(u32),
 mask: Mask,
 len: u32,
 capacity: u32,
-stride: u32,
+stride: u16,
 alignment: Alignment,
 
+const Self = @This();
 const init_size = 8;
 const growth_factor = 2;
 
-pub fn init(self: *@This(), mask: Mask) void {
+pub fn init(self: *Self, mask: Mask) void {
     const alignment = rtti.alignFromMask(mask);
     const stride: u16 = @intCast(rtti.sizeFromMask(mask, null));
     assert(stride > 0);
+    std.debug.print("Init with mask = {}, stride = {}, align = {}\n", .{ mask.mask, stride, alignment });
 
     self.* = .{
         .buffer = &.{},
@@ -37,35 +39,35 @@ pub fn init(self: *@This(), mask: Mask) void {
     };
 }
 
-pub fn deinit(self: *@This(), alloc: Allocator) void {
+pub fn deinit(self: *Self, alloc: Allocator) void {
     alloc.rawFree(self.buffer[0 .. self.capacity * self.stride], self.alignment, @returnAddress());
     self.ids.deinit(alloc);
 }
 
-pub fn has(self: *const @This(), T: type) bool {
+pub fn has(self: *const Self, T: type) bool {
     return self.mask.isSet(typeId(T));
 }
 
-pub fn hasExact(self: *const @This(), Row: type) bool {
+pub fn hasExact(self: *const Self, Row: type) bool {
     return self.mask.eql(rtti.maskFromType(Row));
 }
 
-pub fn hasAll(self: *const @This(), Row: type) bool {
+pub fn hasAll(self: *const Self, Row: type) bool {
     return self.mask.supersetOf(rtti.maskFromType(Row));
 }
 
-pub fn getBytes(self: *const @This(), i: u32) []u8 {
+pub fn getBytes(self: *const Self, i: u32) []u8 {
     return self.buffer[i * self.stride ..][0..self.stride];
 }
 
-pub fn getRow(self: *const @This(), Row: type, i: u32) *Row {
+pub fn getRow(self: *const Self, Row: type, i: u32) *Row {
     assert(rtti.ensureInorder(Row));
     assert(self.hasExact(Row));
 
     return @ptrCast(@alignCast(self.getBytes(i)));
 }
 
-pub fn getMany(self: *const @This(), i: u32, Row: type) rtti.PtrsTo(Row) {
+pub fn getMany(self: *const Self, i: u32, Row: type) rtti.PtrsTo(Row) {
     // TODO: This is a temporary solution. Users shouldn't have to
     // remember the order in which they created types. This is hard to
     // fix until typeId can be made to work at comptime, however.
@@ -95,7 +97,7 @@ pub fn getMany(self: *const @This(), i: u32, Row: type) rtti.PtrsTo(Row) {
     return res;
 }
 
-pub fn getComp(self: *const @This(), i: u32, T: type) *T {
+pub fn getComp(self: *const Self, i: u32, T: type) *T {
     assert(self.has(T));
 
     const row = self.getBytes(i);
@@ -104,11 +106,11 @@ pub fn getComp(self: *const @This(), i: u32, T: type) *T {
     return @ptrCast(@alignCast(comp));
 }
 
-pub fn values(self: *const @This(), Row: type) []Row {
+pub fn values(self: *const Self, Row: type) []Row {
     return @as([*]Row, @ptrCast(@alignCast(self.buffer)))[0..self.len];
 }
 
-fn resize(self: *@This(), alloc: Allocator, capacity: u32) !void {
+fn resize(self: *Self, alloc: Allocator, capacity: u32) !void {
     assert(capacity > self.capacity);
     defer self.capacity = capacity;
 
@@ -129,7 +131,7 @@ fn resize(self: *@This(), alloc: Allocator, capacity: u32) !void {
     self.buffer = new_buf;
 }
 
-pub fn new(self: *@This(), alloc: Allocator, entry: u32) !u32 {
+pub fn new(self: *Self, alloc: Allocator, entry: u32) !u32 {
     if (self.len >= self.capacity) {
         const size = @max(init_size, self.capacity * growth_factor);
         try self.resize(alloc, size);
@@ -142,19 +144,34 @@ pub fn new(self: *@This(), alloc: Allocator, entry: u32) !u32 {
     return self.len;
 }
 
-pub fn create(self: *@This(), alloc: Allocator, row: anytype, entry: u32) !u32 {
+pub fn create(self: *Self, alloc: Allocator, row: anytype, entry: u32) !u32 {
     const Row = @TypeOf(row);
     assert(rtti.ensureInorder(Row));
     assert(self.hasExact(Row));
 
     const i = try self.new(alloc, entry);
-    self.getRow(Row, i).* = row;
+    const bytes = self.getBytes(i);
+
+    // Zig infers the type of row to have comptime fields, which makes it a
+    // zero sized type. This makes it so that `self.getRow(Row, i).* = row`
+    // won't work, since `@sizeOf(Row)` will be zero. The workaround is to set
+    // each field manually, like so.
+    comptime var offset: usize = 0;
+    inline for (std.meta.fields(Row)) |field| {
+        const T = field.type;
+        comptime offset = Alignment.of(T).forward(offset);
+        defer offset += @sizeOf(T);
+
+        const comp: *T = @ptrCast(@alignCast(&bytes[offset]));
+        comp.* = @field(row, field.name);
+    }
+
     return i;
 }
 
 /// Copy entity from `other` at index `other_i` to `self`. Only copies
 /// components present in `self`. Returns the new row index.
-pub fn copy(self: *@This(), other: *const @This(), alloc: Allocator, other_i: u32) !u32 {
+pub fn copy(self: *Self, other: *const Self, alloc: Allocator, other_i: u32) !u32 {
     const self_i = try self.new(alloc, other.ids.items[other_i]);
 
     var self_offset: usize = self_i * self.stride;
@@ -190,7 +207,7 @@ pub fn copy(self: *@This(), other: *const @This(), alloc: Allocator, other_i: u3
 
 /// Swaps item to remove with last element amd
 /// returns entry index of swapped element.
-pub fn delete(self: *@This(), i: u32) u32 {
+pub fn delete(self: *Self, i: u32) u32 {
     const len = self.len - 1;
     self.len = len;
     const id = self.ids.items[len];

@@ -32,7 +32,7 @@ pub fn main() !void {
     // const d1 = .{ @as(u8, 1), @as(u16, 2) };
     // std.debug.print("size: {}, type: {s}\n", .{ @sizeOf(@TypeOf(d1)), @typeName(@TypeOf(d1)) });
 
-    const player = try ecs.create(Arch{
+    const player = try ecs.create(.{
         .pos = Position{ .x = 0, .y = 5 },
         .vel = Velocity{ .dx = 1, .dy = 2 },
     });

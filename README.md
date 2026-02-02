@@ -55,7 +55,6 @@ const Velocity = struct {
 };
 
 // A set of components we want to use
-// In the future, it won't be necessary to explicitly define them up front like this
 const Arch = struct {
     pos: Position,
     vel: Velocity,
@@ -70,8 +69,8 @@ pub fn main() !void {
     var ecs: World = .init(alloc);
     defer ecs.deinit();
 
-    // Create an entity by passing a pointer to the component data
-    const player = try ecs.create(&Arch{
+    // Create an entity by passing the component data
+    const player = try ecs.create(.{
         .pos = Position{ .x = 0, .y = 5 },
         .vel = Velocity{ .dx = 1, .dy = 2 },
     })
