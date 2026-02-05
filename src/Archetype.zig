@@ -26,7 +26,6 @@ pub fn init(self: *Self, mask: Mask) void {
     const alignment = rtti.alignFromMask(mask);
     const stride: u16 = @intCast(rtti.sizeFromMask(mask, null));
     assert(stride > 0);
-    std.debug.print("Init with mask = {}, stride = {}, align = {}\n", .{ mask.mask, stride, alignment });
 
     self.* = .{
         .buffer = &.{},
@@ -127,7 +126,10 @@ fn resize(self: *Self, alloc: Allocator, capacity: u32) !void {
         orelse return error.OutOfMemory;
     const copy_bytes = self.len * self.stride;
     @memcpy(new_buf[0..copy_bytes], self.buffer);
-    alloc.free(buf);
+    if (buf.len > 0) {
+        @branchHint(.likely);
+        alloc.rawFree(buf, self.alignment, @returnAddress());
+    }
     self.buffer = new_buf;
 }
 
