@@ -15,6 +15,8 @@
           zig
           zls
           lldb
+          perf
+          tracy
         ];
       };
     };
