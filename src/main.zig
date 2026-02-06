@@ -56,8 +56,18 @@ pub fn main() !void {
     std.debug.print("Player has data {any}\n", .{ecs.getMany(player, struct { Velocity })});
     std.debug.print("Player has data {any}\n", .{ecs.getRow(struct { Position, Velocity }, player)});
 
-    for (0..3) |_| {
-        ecs.each(Arch, movement);
+    try ecs.addValue(e1, Position{ .x = 13, .y = 7 });
+    try ecs.addValue(e1, Velocity{ .dx = -2, .dy = -2 });
+    std.debug.print("e1 has data {any}\n", .{ecs.getMany(e1, struct { Position, Velocity })});
+
+    for (0..5) |_| {
+        // ecs.each(Arch, movement);
+        var iter = ecs.iter(struct { pos: Position, vel: Velocity });
+        while (iter.next()) |e| {
+            e.pos.x += e.vel.dx;
+            e.pos.y += e.vel.dy;
+            std.debug.print("Entity now at ({}, {})\n", .{ e.pos.x, e.pos.y });
+        }
     }
 
     ecs.delete(player);

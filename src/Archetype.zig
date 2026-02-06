@@ -75,13 +75,13 @@ pub fn getMany(self: *const Self, i: u32, Row: type) rtti.PtrsTo(Row) {
 
     var res: rtti.PtrsTo(Row) = undefined;
     var offset: usize = i * self.stride;
-    var iter = self.mask.iterator(.{});
+    var bits = self.mask.iterator(.{});
 
     inline for (std.meta.fields(Row)) |field| {
-        var info_i = iter.next().?;
+        var info_i = bits.next().?;
         while (info_i < typeId(field.type)) {
             const info = rtti.type_infos[info_i];
-            info_i = iter.next() orelse break;
+            info_i = bits.next() orelse break;
             offset = info.alignment.forward(offset) + info.size;
         }
 
@@ -178,20 +178,20 @@ pub fn copy(self: *Self, other: *const Self, alloc: Allocator, other_i: u32) !u3
 
     var self_offset: usize = self_i * self.stride;
     var other_offset: usize = other_i * other.stride;
-    var self_iter = self.mask.iterator(.{});
-    var other_iter = other.mask.iterator(.{});
+    var self_bits = self.mask.iterator(.{});
+    var other_bits = other.mask.iterator(.{});
 
     // Iterate over components in other entity
-    while (self_iter.next()) |i| {
+    while (self_bits.next()) |i| {
         const info = rtti.type_infos[i];
         self_offset = info.alignment.forward(self_offset);
         defer self_offset += info.size;
 
         if (other.mask.isSet(i)) {
-            var info_i = other_iter.next().?;
+            var info_i = other_bits.next().?;
             while (info_i < i) {
                 const other_info = rtti.type_infos[info_i];
-                info_i = other_iter.next() orelse break;
+                info_i = other_bits.next() orelse break;
                 other_offset = other_info.alignment.forward(other_offset) + other_info.size;
             }
 
@@ -221,8 +221,68 @@ pub fn delete(self: *Self, i: u32) u32 {
 
     if (len > 0) {
         @memset(self.getBytes(len), undefined);
-        self.ids.shrinkRetainingCapacity(len);
         self.ids.items[len] = undefined;
+        self.ids.shrinkRetainingCapacity(len);
     }
     return id;
+}
+
+pub fn iter(self: *const Self, Row: type) Iterator(Row) {
+    assert(rtti.ensureInorder(Row));
+    assert(self.hasAll(Row));
+    return .init(self);
+}
+
+pub fn Iterator(Row: type) type {
+    return struct {
+        offsets: @Vector(std.meta.fields(T).len, usize),
+        len: usize,
+        stride: u16,
+
+        const T = rtti.PtrsTo(Row);
+
+        // TODO: Deduplicate code
+        pub fn init(arch: *const Self) @This() {
+            assert(arch.hasAll(Row));
+
+            var self: @This() = .{
+                .offsets = undefined,
+                .len = arch.len,
+                .stride = arch.stride,
+            };
+
+            var bits = arch.mask.iterator(.{});
+            var offset: usize = @intFromPtr(arch.buffer);
+            inline for (std.meta.fields(Row), 0..) |field, i| {
+                var info_i = bits.next().?;
+                while (info_i < typeId(field.type)) {
+                    const info = rtti.type_infos[info_i];
+                    info_i = bits.next() orelse break;
+                    offset = info.alignment.forward(offset) + info.size;
+                }
+
+                const info = rtti.type_infos[info_i];
+                offset = info.alignment.forward(offset);
+                defer offset += info.size;
+
+                self.offsets[i] = offset;
+            }
+
+            return self;
+        }
+
+        pub fn next(self: *@This()) ?T {
+            if (self.len <= 0) return null;
+            self.len -= 1;
+            defer self.offsets += @splat(self.stride);
+
+            // This should compile to a noop, just return the offsets directly
+            // TODO: Verify
+            var item: T = undefined;
+            inline for (comptime std.meta.fieldNames(T), 0..) |name, i|
+                @field(item, name) = @ptrFromInt(self.offsets[i]);
+
+            return item;
+        }
+    };
 }

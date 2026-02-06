@@ -20,6 +20,8 @@ pub const EntityID = packed struct {
 pub const EntityEntry = struct {
     archetype: u32,
     gen: u32,
+    // TODO: Make this a union for better type safety
+    // Maybe like `index: union { row: u32, free: u32 }`
     row: u32,
 };
 
@@ -118,6 +120,8 @@ fn GetResult(T: type) type {
     };
 }
 
+// TODO: This doesn't really work. Is there a way to do something different for
+// anonymous types vs defined container types? Would that be too cursed?
 pub fn get(self: *const Self, id: EntityID, T: anytype) Error!GetResult(@TypeOf(T)) {
     return switch (@TypeOf(T)) {
         []const type => self.getMany(id, std.meta.Tuple(T)),
@@ -153,7 +157,7 @@ pub fn getOrAdd(self: *Self, id: EntityID, T: type) !*T {
 }
 
 pub fn getOrAddValue(self: *Self, id: EntityID, T: type, default: *const T) !*T {
-    return self.getComp(id, T) orelse self.add(id, default);
+    return self.getComp(id, T) orelse self.addValue(id, default);
 }
 
 pub fn has(self: *const Self, id: EntityID, T: type) bool {
@@ -212,60 +216,45 @@ pub fn remove(self: *Self, id: EntityID, T: type) !void {
     self.entries.items[i].row = old_row;
 }
 
-pub fn Iterator(T: type, iter_all: bool) type {
+pub fn iter(self: *Self, Row: type) Iterator(Row) {
+    return .init(self);
+}
+
+pub fn Iterator(Row: type) type {
     return struct {
         ecs: *Self,
-        archetype: ?*Archetype,
-        archetype_i: usize,
-        row_i: u32,
+        arch_iter: ?Archetype.Iterator(Row),
+        arch_i: usize,
 
         pub fn init(ecs: *Self) @This() {
             var self: @This() = .{
                 .ecs = ecs,
-                .archetype = null,
-                .archetype_i = 0,
-                .row_i = 0,
+                .arch_iter = null,
+                .arch_i = 0,
             };
-            _ = self.nextArch();
+            self.arch_iter = self.nextArch();
             return self;
         }
 
-        pub fn next(self: *@This()) ?*T {
-            var arch = self.archetype orelse return null;
-            if (self.row_i >= arch.len) {
-                _ = self.nextArch();
-                arch = self.archetype orelse return null;
-            }
-
-            defer self.row_i += 1;
-            return arch.get(T, self.row_i);
+        pub fn next(self: *@This()) ?rtti.PtrsTo(Row) {
+            if (self.arch_iter == null) return null;
+            return self.arch_iter.?.next() orelse blk: {
+                self.arch_iter = self.nextArch() orelse return null;
+                break :blk self.arch_iter.?.next().?;
+            };
         }
 
-        fn nextArch(self: *@This()) bool {
-            while (self.archetype_i < self.ecs.archetypes.count()) : (self.archetype_i += 1) {
-                const arch = &self.ecs.archetypes.values()[self.archetype_i];
-                if (match(arch)) {
-                    self.archetype = arch;
-                    return true;
-                }
-            } else return false;
-        }
-
-        fn match(arch: *const Archetype) bool {
-            if (iter_all) {
-                return arch.hasAll(T);
-            } else {
-                return arch.hasExact(T);
-            }
+        fn nextArch(self: *@This()) ?Archetype.Iterator(Row) {
+            return while (self.arch_i < self.ecs.archetypes.count()) {
+                defer self.arch_i += 1;
+                const arch = &self.ecs.archetypes.values()[self.arch_i];
+                if (arch.hasAll(Row) and arch.len > 0) break arch.iter(Row);
+            } else null;
         }
     };
 }
 
-pub fn all(self: *Self, Row: type) Iterator(Row, true) {
-    return .init(self);
-}
-
-pub fn each(self: *Self, T: type, f: fn (*T) void) void {
+pub inline fn each(self: *Self, T: type, f: fn (*T) void) void {
     for (self.archetypes.values()) |*arch| {
         if (arch.hasExact(T)) {
             for (arch.values(T)) |*row| {

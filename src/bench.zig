@@ -112,12 +112,21 @@ pub fn main() !void {
     }
     const elapsed_remove = timer.read();
 
+    timer.reset();
+    var iter = ecs.iter(struct { pos: Position, vel: Velocity });
+    while (iter.next()) |e| {
+        e.pos.x += e.vel.dx;
+        e.pos.y += e.vel.dy;
+    }
+    const elapsed_iter = timer.read();
+
     const elapsed_create_s: f64 = @as(f64, @floatFromInt(elapsed_create)) / 1e9;
     const elapsed_delete_s: f64 = @as(f64, @floatFromInt(elapsed_delete)) / 1e9;
     const elapsed_reuse_s: f64 = @as(f64, @floatFromInt(elapsed_reuse)) / 1e9;
     const elapsed_add_s: f64 = @as(f64, @floatFromInt(elapsed_add)) / 1e9;
     const elapsed_get_s: f64 = @as(f64, @floatFromInt(elapsed_get)) / 1e9;
     const elapsed_remove_s: f64 = @as(f64, @floatFromInt(elapsed_remove)) / 1e9;
+    const elapsed_iter_s: f64 = @as(f64, @floatFromInt(elapsed_iter)) / 1e9;
     print("Ran {} iterations\n", .{iterations});
     print("Create:\n", .{});
     print("  Elapsed time: {:.3} s\n", .{elapsed_create_s});
@@ -143,4 +152,8 @@ pub fn main() !void {
     print("  Elapsed time: {:.3} s\n", .{elapsed_remove_s});
     print("  Average time per op: {e:.3} s\n", .{elapsed_remove_s / @as(f64, @floatFromInt(iterations))});
     print("  Throughput: {} ops/s\n", .{@round(@as(f64, @floatFromInt(iterations)) / elapsed_remove_s)});
+    print("Iterate:\n", .{});
+    print("  Elapsed time: {:.3} s\n", .{elapsed_iter_s});
+    print("  Average time per op: {e:.3} s\n", .{elapsed_iter_s / @as(f64, @floatFromInt(iterations))});
+    print("  Throughput: {} ops/s\n", .{@round(@as(f64, @floatFromInt(iterations)) / elapsed_iter_s)});
 }
