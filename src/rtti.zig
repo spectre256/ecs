@@ -4,14 +4,14 @@ const typeId = @import("typeid.zig").typeId;
 
 pub const num_comps: usize = 64;
 pub var type_infos: [num_comps]struct {
-    size: usize,
+    size: u16,
     alignment: Alignment,
 } = undefined;
 pub const Mask = std.StaticBitSet(num_comps);
 
 pub fn registerType(T: type) void {
     type_infos[typeId(T)] = .{
-        .size = @sizeOf(T),
+        .size = @intCast(@sizeOf(T)),
         .alignment = .of(T),
     };
 }
@@ -48,6 +48,17 @@ pub fn sizeFromMask(mask: Mask, maybe_end: ?usize) usize {
     return total;
 }
 
+pub fn maskIndexOf(mask: Mask, T: type) ?usize {
+    return maskIndexOfBit(mask, typeId(T));
+}
+
+pub fn maskIndexOfBit(mask: Mask, i: usize) ?usize {
+    if (!mask.isSet(i)) return null;
+    var m = mask;
+    m.setRangeValue(.{ .start = i, .end = Mask.bit_length }, false);
+    return m.count();
+}
+
 pub fn alignFromMask(mask: Mask) Alignment {
     var res: Alignment = .@"1";
     var iter = mask.iterator(.{});
@@ -82,6 +93,7 @@ pub fn PtrsTo(Row: type) type {
         field.type = *field.type;
         field.default_value_ptr = null;
         field.alignment = @alignOf(*field.type);
+        field.is_comptime = false;
     }
     return @Type(.{ .@"struct" = .{
         .layout = .auto,

@@ -37,38 +37,36 @@ pub fn main() !void {
         .vel = Velocity{ .dx = 1, .dy = 2 },
     });
     std.debug.print("Added player, id {}\n", .{player});
-    std.debug.print("Player has data {any}\n", .{ecs.getRow(struct { Position, Velocity }, player)});
+    std.debug.print("Player has data {any}\n", .{ecs.get(player, struct { Position, Velocity })});
     std.debug.print("Player's velocity: {any}, position: {any}, bogus: {any}\n", .{
         ecs.getComp(player, Velocity),
         ecs.getComp(player, Position),
         ecs.getComp(player, u16),
     });
     const data = .{ @as(u8, 1), @as(u16, 2) };
-    std.debug.print("Player has data {any}\n", .{ecs.getMany(player, struct { Position, Velocity })});
+    std.debug.print("Player has data {any}\n", .{ecs.get(player, struct { Position, Velocity })});
     const e1 = try ecs.create(data);
     const e2 = try ecs.create(data);
-    std.debug.print("Player has data {any}\n", .{ecs.getMany(player, struct { Position, Velocity })});
+    std.debug.print("Player has data {any}\n", .{ecs.get(player, struct { Position, Velocity })});
     std.debug.print("Added other entities, ids {} and {}\n", .{ e1, e2 });
     try ecs.addValue(player, Name{ .name = "Bob" });
-    std.debug.print("Player has data {any}\n", .{ecs.getMany(player, struct { Position, Velocity })});
-    std.debug.print("Player has data {any}\n", .{ecs.getRow(struct { Name, Position, Velocity }, player)});
+    std.debug.print("Player has data {any}\n", .{ecs.get(player, struct { Position, Velocity })});
     try ecs.remove(player, Name);
-    std.debug.print("Player has data {any}\n", .{ecs.getMany(player, struct { Velocity })});
-    std.debug.print("Player has data {any}\n", .{ecs.getRow(struct { Position, Velocity }, player)});
+    std.debug.print("Player has data {any}\n", .{ecs.get(player, struct { Velocity })});
 
     try ecs.addValue(e1, Position{ .x = 13, .y = 7 });
     try ecs.addValue(e1, Velocity{ .dx = -2, .dy = -2 });
-    std.debug.print("e1 has data {any}\n", .{ecs.getMany(e1, struct { Position, Velocity })});
+    std.debug.print("e1 has data {any}\n", .{ecs.get(e1, struct { Position, Velocity })});
 
-    for (0..5) |_| {
-        // ecs.each(Arch, movement);
-        var iter = ecs.iter(struct { pos: Position, vel: Velocity });
-        while (iter.next()) |e| {
-            e.pos.x += e.vel.dx;
-            e.pos.y += e.vel.dy;
-            std.debug.print("Entity now at ({}, {})\n", .{ e.pos.x, e.pos.y });
-        }
-    }
+    // for (0..5) |_| {
+    //     // ecs.each(Arch, movement);
+    //     var iter = ecs.iter(struct { pos: Position, vel: Velocity });
+    //     while (iter.next()) |e| {
+    //         e.pos.x += e.vel.dx;
+    //         e.pos.y += e.vel.dy;
+    //         std.debug.print("Entity now at ({}, {})\n", .{ e.pos.x, e.pos.y });
+    //     }
+    // }
 
     ecs.delete(player);
 }
