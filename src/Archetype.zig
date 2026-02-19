@@ -156,7 +156,7 @@ fn gatherRtti(self: *const Self, Row: type, offsets: *[std.meta.fields(Row).len]
     }
 }
 
-pub fn get(self: *const Self, chunk: *const Chunk, row: u16, Row: type) rtti.PtrsTo(Row) {
+pub fn get(self: *const Self, chunk: *Chunk, row: u16, Row: type) rtti.PtrsTo(Row) {
     // TODO: This is a temporary solution. Users shouldn't have to
     // remember the order in which they created types. This is hard to
     // fix until typeId can be made to work at comptime, however.
@@ -169,13 +169,15 @@ pub fn get(self: *const Self, chunk: *const Chunk, row: u16, Row: type) rtti.Ptr
     self.gatherRtti(Row, &offsets, &sizes);
 
     // Calculate pointers
-    const base: Vec = @splat(@intFromPtr(&chunk.buffer));
-    const ptrs: Vec = base + offsets + sizes * @as(Vec, @splat(row));
+    // const base: Vec = @splat(@intFromPtr(&chunk.buffer));
+    // const ptrs: Vec = base + offsets + sizes * @as(Vec, @splat(row));
 
     // Noop, just cast the pointers
     var res: rtti.PtrsTo(Row) = undefined;
-    inline for (comptime std.meta.fieldNames(Row), 0..) |name, i|
-        @field(res, name) = @ptrFromInt(ptrs[i]);
+    inline for (comptime std.meta.fieldNames(Row), 0..) |name, i| {
+        // @field(res, name) = @ptrFromInt(ptrs[i]);
+        @field(res, name) = @ptrCast(@alignCast(&chunk.buffer[offsets[i] + sizes[i] * row]));
+    }
 
     return res;
 }
@@ -196,7 +198,7 @@ pub fn new(self: *Self, alloc: Allocator, arch_i: u16, entry: u32) !NewResult {
         const chunk: *Chunk = @fieldParentPtr("header", header);
         const i = chunk.new(entry, self.capacity);
         if (chunk.isFull(self.capacity)) {
-            self.free_chunks.remove(node);
+            _ = self.free_chunks.popFirst();
             self.full_chunks.prepend(node);
         }
         return .{ chunk, i };
@@ -254,6 +256,13 @@ pub fn delete(self: *Self, chunk: *Chunk, i: u32) ?u32 {
     assert(i <= len);
     chunk.header.len = len;
     const id = chunk.ids()[len];
+
+    // If deleting from a full chunk, move from full chunk list to free chunk list
+    const should_move = chunk.isFull(self.capacity);
+    defer if (should_move) {
+        self.full_chunks.remove(&chunk.header.node); // TODO: Oh, so this is why I need a doubly linked list...
+        self.free_chunks.prepend(&chunk.header.node);
+    };
 
     if (i != len) {
         @branchHint(.likely);
