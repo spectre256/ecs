@@ -2,15 +2,18 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 const Pool = std.heap.MemoryPool(Chunk);
-const LinkedList = std.DoublyLinkedList;
+const List = std.DoublyLinkedList;
 const assert = std.debug.assert;
+const Chunk = @import("Chunk.zig");
+const ChunkPool = @import("ChunkPool.zig");
 const typeId = @import("typeid.zig").typeId;
 const rtti = @import("rtti.zig");
 const Mask = rtti.Mask;
 
-/// List of chunks. Free chunks at the beginning, full
-/// chunks at the end
-chunks: LinkedList,
+/// Linked list of chunks. Chunks with free space at
+/// the beginning, full chunks at the end. Empty chunks
+/// are removed
+chunks: List,
 /// Offsets of each component array in chunk buffer
 offsets: []u16,
 /// Component sizes
@@ -22,56 +25,6 @@ capacity: u16,
 
 const Self = @This();
 pub const NewResult = struct { *Chunk, u16 };
-pub const Chunk = struct {
-    header: Header,
-    buffer: [buffer_size]u8 align(@alignOf(u32)),
-
-    const buffer_size: usize = std.heap.page_size_min - @sizeOf(Header);
-    const Header = struct {
-        node: LinkedList.Node,
-        arch: u16,
-        len: u16,
-    };
-
-    pub fn init(self: *@This(), arch: u16) void {
-        self.* = .{
-            .header = .{
-                .node = .{},
-                .arch = arch,
-                .len = 0,
-            },
-            .buffer = undefined,
-        };
-    }
-
-    pub fn ids(self: *@This()) [*]u32 {
-        return @as([*]u32, @ptrCast(&self.buffer));
-    }
-
-    pub fn new(self: *@This(), entry: u32, capacity: u16) u16 {
-        assert(self.header.len < capacity);
-        defer self.header.len += 1;
-        self.ids()[self.header.len] = entry;
-        return self.header.len;
-    }
-
-    pub fn isEmpty(self: *const @This()) bool {
-        return self.header.len <= 0;
-    }
-
-    pub fn isFull(self: *const @This(), capacity: u16) bool {
-        return self.header.len >= capacity;
-    }
-
-    pub fn next(self: *const @This()) ?*@This() {
-        return .from(self.header.node.next);
-    }
-
-    pub fn from(node: ?*LinkedList.Node) ?*@This() {
-        const header: *Chunk.Header = @fieldParentPtr("node", node orelse return null);
-        return @fieldParentPtr("header", header);
-    }
-};
 
 pub fn init(self: *Self, mask: Mask, alloc: Allocator) !void {
     const len = mask.count();
@@ -121,15 +74,14 @@ pub fn init(self: *Self, mask: Mask, alloc: Allocator) !void {
     };
 }
 
-pub fn deinit(self: *Self, alloc: Allocator) void {
+pub fn deinit(self: *Self, pool: *ChunkPool, alloc: Allocator) void {
     self.offsets.len *= 2; // Allocated in same buffer as sizes
     alloc.free(self.offsets);
 
-    // TODO: Actual chunk allocator
-    var next: ?*Chunk = .from(self.chunks.first);
+    var next: ?*Chunk = .fromOpt(self.chunks.first);
     while (next) |chunk| {
         next = chunk.next();
-        alloc.destroy(chunk);
+        pool.destroy(chunk);
     }
 }
 
@@ -146,8 +98,7 @@ pub fn hasAll(self: *const Self, Row: type) bool {
 }
 
 pub fn isEmpty(self: *const Self) bool {
-    const chunk = Chunk.from(self.chunks.first) orelse return true;
-    return chunk.isEmpty();
+    return self.chunks.first == null;
 }
 
 /// Computes offsets and sizes for desired components
@@ -196,8 +147,8 @@ pub fn getComp(self: *const Self, chunk: *Chunk, row: u16, T: type) *T {
     return @ptrCast(@alignCast(ptr));
 }
 
-pub fn new(self: *Self, alloc: Allocator, arch_i: u16, entry: u32) !NewResult {
-    if (Chunk.from(self.chunks.first)) |chunk| {
+pub fn new(self: *Self, pool: *ChunkPool, arch_i: u16, entry: u32) !NewResult {
+    if (Chunk.fromOpt(self.chunks.first)) |chunk| {
         if (!chunk.isFull(self.capacity)) {
             const i = chunk.new(entry, self.capacity);
             if (chunk.isFull(self.capacity)) {
@@ -208,19 +159,18 @@ pub fn new(self: *Self, alloc: Allocator, arch_i: u16, entry: u32) !NewResult {
         }
     }
 
-    // TODO: Actual chunk allocator
-    const chunk = try alloc.create(Chunk);
+    const chunk = try pool.create();
     chunk.init(arch_i);
     self.chunks.prepend(&chunk.header.node);
     return .{ chunk, chunk.new(entry, self.capacity) };
 }
 
-pub fn create(self: *Self, alloc: Allocator, row: anytype, arch_i: u16, entry: u32) !NewResult {
+pub fn create(self: *Self, pool: *ChunkPool, row: anytype, arch_i: u16, entry: u32) !NewResult {
     const Row = @TypeOf(row);
     assert(rtti.ensureInorder(Row));
     assert(self.hasExact(Row));
 
-    const chunk, const i = try self.new(alloc, arch_i, entry);
+    const chunk, const i = try self.new(pool, arch_i, entry);
     const ptrs = self.get(chunk, i, Row);
 
     inline for (comptime std.meta.fieldNames(Row)) |name|
@@ -231,8 +181,8 @@ pub fn create(self: *Self, alloc: Allocator, row: anytype, arch_i: u16, entry: u
 
 /// Copy entity from `other` at index `other_i` to `self`. Only copies
 /// components present in `self`. Returns the new row index.
-pub fn copyFrom(self: *Self, other: *const Self, alloc: Allocator, arch_i: u16, other_chunk: *Chunk, other_i: u32) !NewResult {
-    const self_chunk, const self_i = try self.new(alloc, arch_i, other_chunk.ids()[other_i]);
+pub fn copyFrom(self: *Self, other: *const Self, pool: *ChunkPool, arch_i: u16, other_chunk: *Chunk, other_i: u32) !NewResult {
+    const self_chunk, const self_i = try self.new(pool, arch_i, other_chunk.ids()[other_i]);
 
     // Iterate over components in both entities and copy
     var bits = self.mask.intersectWith(other.mask).iterator(.{});
@@ -255,15 +205,19 @@ pub fn copyFrom(self: *Self, other: *const Self, alloc: Allocator, arch_i: u16, 
 
 /// Swaps item to delete with last element and returns entry index of swapped
 /// element, or null if the last element was deleted
-pub fn delete(self: *Self, chunk: *Chunk, i: u32) ?u32 {
+pub fn delete(self: *Self, pool: *ChunkPool, chunk: *Chunk, i: u32) ?u32 {
     const len = chunk.header.len - 1;
     assert(i <= len);
     chunk.header.len = len;
     const id = chunk.ids()[len];
 
+    // If the chunk is empty after deletion, free it
     // If deleting from a full chunk, move from full chunk list to free chunk list
     const should_move = chunk.isFull(self.capacity);
-    defer if (should_move) {
+    defer if (chunk.isEmpty()) {
+        self.chunks.remove(&chunk.header.node);
+        pool.destroyWithReuse(chunk);
+    } else if (should_move) {
         self.chunks.remove(&chunk.header.node);
         self.chunks.append(&chunk.header.node);
     };
@@ -311,7 +265,7 @@ pub fn Iterator(Row: type) type {
                 .offsets = undefined,
                 .ptrs = undefined,
                 .sizes = undefined,
-                .chunk = .from(arch.chunks.first),
+                .chunk = .fromOpt(arch.chunks.first),
                 .row = 0,
                 .len = undefined,
             };
@@ -328,13 +282,9 @@ pub fn Iterator(Row: type) type {
 
         pub fn next(self: *@This()) ?T {
             var chunk = self.chunk orelse return null;
-            // TODO: Need to have a dedicated chunk pool to avoid empty chunks completely?
             if (self.row >= self.len) {
-                while (true) {
-                    self.chunk = chunk.next();
-                    chunk = self.chunk orelse return null;
-                    if (!chunk.isEmpty()) break;
-                }
+                self.chunk = chunk.next();
+                chunk = self.chunk orelse return null;
 
                 // Reset iterator
                 self.row = 0;

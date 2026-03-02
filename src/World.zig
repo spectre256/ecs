@@ -1,9 +1,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Map = std.AutoArrayHashMapUnmanaged;
-const List = std.ArrayList;
+const Array = std.ArrayList;
 const assert = std.debug.assert;
 const Archetype = @import("Archetype.zig");
+const Chunk = @import("Chunk.zig");
+const ChunkPool = @import("ChunkPool.zig");
 const typeId = @import("typeid.zig").typeId;
 const rtti = @import("rtti.zig");
 const Mask = rtti.Mask;
@@ -18,7 +20,7 @@ pub const EntityID = packed struct {
 };
 
 pub const EntityEntry = struct {
-    chunk: *Archetype.Chunk,
+    chunk: *Chunk,
     gen: u32, // Generation number. For tracking liveness
     index: union {
         free: u32, // Next freelist entry. If last entry, this points to itself
@@ -30,26 +32,32 @@ pub const EntityEntry = struct {
 };
 
 archetypes: Map(Mask, Archetype),
-entries: List(EntityEntry),
+entries: Array(EntityEntry),
 alloc: Allocator,
+pool: ChunkPool,
 /// Index of the head of free entries, if there is one
 free_entry: ?u32,
 
 const Self = @This();
+pub const Options = struct {
+    page_alloc: Allocator = std.heap.page_allocator,
+};
 
-pub fn init(alloc: Allocator) Self {
+pub fn init(alloc: Allocator, opts: Options) Self {
     return .{
         .archetypes = .empty,
         .entries = .empty,
         .alloc = alloc,
+        .pool = .init(opts.page_alloc),
         .free_entry = null,
     };
 }
 
 pub fn deinit(self: *Self) void {
     for (self.archetypes.values()) |*arch|
-        arch.deinit(self.alloc);
+        arch.deinit(&self.pool, self.alloc);
     self.archetypes.deinit(self.alloc);
+    self.pool.reclaimUnused();
     self.entries.deinit(self.alloc);
 }
 
@@ -57,8 +65,8 @@ pub fn create(self: *Self, row: anytype) !EntityID {
     const res = try self.getArch(rtti.maskFromType(@TypeOf(row)));
     const arch = res.value_ptr;
     const arch_i: u16 = @intCast(res.index);
-    const chunk, const row_i = try arch.create(self.alloc, row, arch_i, undefined);
-    errdefer _ = arch.delete(chunk, row_i);
+    const chunk, const row_i = try arch.create(&self.pool, row, arch_i, undefined);
+    errdefer _ = arch.delete(&self.pool, chunk, row_i);
 
     // Reuse deleted entry if possible
     if (self.free_entry) |entry_i| {
@@ -113,7 +121,7 @@ pub fn delete(self: *Self, id: EntityID) void {
     const arch = self.archFromEntry(entry.*);
     const row = entry.index.used.row;
     // Delete from archetype and update moved entry
-    if (arch.delete(entry.chunk, row)) |i|
+    if (arch.delete(&self.pool, entry.chunk, row)) |i|
         self.entries.items[i].index.used.row = row;
 
     // Prepend free entry
@@ -122,7 +130,7 @@ pub fn delete(self: *Self, id: EntityID) void {
     self.free_entry = id.row;
 }
 
-pub fn alive(self: *const Self, id: EntityID) bool {
+pub fn isAlive(self: *const Self, id: EntityID) bool {
     return id.gen == self.entries.items[id.row].gen;
 }
 
@@ -178,14 +186,14 @@ pub fn add(self: *Self, id: EntityID, T: type) !*T {
     const old_arch = self.archFromEntry(entry.*); // Get again in case archetype map is resized
     const old_chunk = entry.chunk;
     const old_row = entry.index.used.row;
-    const new_chunk, const new_row = try new_arch.copyFrom(old_arch, self.alloc, new_arch_i, old_chunk, old_row);
+    const new_chunk, const new_row = try new_arch.copyFrom(old_arch, &self.pool, new_arch_i, old_chunk, old_row);
     entry.chunk = new_chunk;
     entry.index.used = .{
         .row = new_row,
         .arch = new_arch_i,
     };
 
-    if (old_arch.delete(old_chunk, old_row)) |i|
+    if (old_arch.delete(&self.pool, old_chunk, old_row)) |i|
         self.entries.items[i].index.used.row = old_row;
 
     return new_arch.getComp(new_chunk, new_row, T);
@@ -206,14 +214,14 @@ pub fn remove(self: *Self, id: EntityID, T: type) !void {
     const old_arch = self.archFromEntry(entry.*); // Get again in case archetype map is resized
     const old_chunk = entry.chunk;
     const old_row = entry.index.used.row;
-    const new_chunk, const new_row = try new_arch.copyFrom(old_arch, self.alloc, new_arch_i, old_chunk, old_row);
+    const new_chunk, const new_row = try new_arch.copyFrom(old_arch, &self.pool, new_arch_i, old_chunk, old_row);
     entry.chunk = new_chunk;
     entry.index.used = .{
         .row = new_row,
         .arch = new_arch_i,
     };
 
-    if (old_arch.delete(old_chunk, old_row)) |i|
+    if (old_arch.delete(&self.pool, old_chunk, old_row)) |i|
         self.entries.items[i].index.used.row = old_row;
 }
 

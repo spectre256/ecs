@@ -25,7 +25,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var ecs: World = .init(alloc);
+    var ecs: World = .init(alloc, .{});
     defer ecs.deinit();
 
     const player = try ecs.create(.{
