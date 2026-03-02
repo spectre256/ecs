@@ -238,6 +238,7 @@ pub fn Iterator(Row: type) type {
         }
 
         pub fn next(self: *@This()) ?rtti.PtrsTo(Row) {
+            // Must not copy, so can't use orelse here
             if (self.arch_iter == null) return null;
             return self.arch_iter.?.next() orelse blk: {
                 self.arch_iter = self.nextArch() orelse return null;
@@ -247,9 +248,9 @@ pub fn Iterator(Row: type) type {
 
         fn nextArch(self: *@This()) ?Archetype.Iterator(Row) {
             return while (self.arch_i < self.ecs.archetypes.count()) {
-                defer self.arch_i += 1;
+                defer self.arch_i += 1; // Must not increment after last iteration, so can't use : () syntax
                 const arch = &self.ecs.archetypes.values()[self.arch_i];
-                if (arch.hasAll(Row) and arch.len > 0) break arch.iter(Row);
+                if (arch.hasAll(Row) and !arch.isEmpty()) break arch.iter(Row);
             } else null;
         }
     };

@@ -28,10 +28,6 @@ pub fn main() !void {
     var ecs: World = .init(alloc);
     defer ecs.deinit();
 
-    // const d1: struct { u8, u16 } = undefined;
-    // const d1 = .{ @as(u8, 1), @as(u16, 2) };
-    // std.debug.print("size: {}, type: {s}\n", .{ @sizeOf(@TypeOf(d1)), @typeName(@TypeOf(d1)) });
-
     const player = try ecs.create(.{
         .pos = Position{ .x = 0, .y = 5 },
         .vel = Velocity{ .dx = 1, .dy = 2 },
@@ -58,31 +54,17 @@ pub fn main() !void {
     try ecs.addValue(e1, Velocity{ .dx = -2, .dy = -2 });
     std.debug.print("e1 has data {any}\n", .{ecs.get(e1, struct { Position, Velocity })});
 
-    // for (0..5) |_| {
-    //     // ecs.each(Arch, movement);
-    //     var iter = ecs.iter(struct { pos: Position, vel: Velocity });
-    //     while (iter.next()) |e| {
-    //         e.pos.x += e.vel.dx;
-    //         e.pos.y += e.vel.dy;
-    //         std.debug.print("Entity now at ({}, {})\n", .{ e.pos.x, e.pos.y });
-    //     }
-    // }
+    for (0..5) |_| movement(&ecs);
 
     ecs.delete(player);
 }
 
-fn movement(e: *Arch) void {
-    e.pos.x += e.vel.dx;
-    e.pos.y += e.vel.dy;
-    std.debug.print("Entity {*} now at ({}, {})\n", .{ e, e.pos.x, e.pos.y });
+fn movement(ecs: *World) void {
+    var query = ecs.iter(struct { pos: Position, vel: Velocity });
+    while (query.next()) |e| {
+        e.pos.x += e.vel.dx;
+        e.pos.y += e.vel.dy;
+        std.debug.print("Entity {} now at ({}, {})\n", .{ e, e.pos.x, e.pos.y });
+    }
+    std.debug.print("Done moving entities\n", .{});
 }
-
-// pub fn movement(ecs: *World) void {
-//     var query = ecs.all(struct { pos: Position, vel: Velocity });
-//     while (query.next()) |e| {
-//         e.pos.x += e.vel.dx;
-//         e.pos.y += e.vel.dy;
-//         std.debug.print("Entity {} now at ({}, {})\n", .{ e, e.pos.x, e.pos.y });
-//     }
-//     std.debug.print("Done moving entities\n", .{});
-// }

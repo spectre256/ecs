@@ -2,22 +2,22 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 const Pool = std.heap.MemoryPool(Chunk);
-const LinkedList = std.SinglyLinkedList;
+const LinkedList = std.DoublyLinkedList;
 const assert = std.debug.assert;
 const typeId = @import("typeid.zig").typeId;
 const rtti = @import("rtti.zig");
 const Mask = rtti.Mask;
 
-/// Chunks with free space
-free_chunks: LinkedList,
-/// Full chunks
-full_chunks: LinkedList,
+/// List of chunks. Free chunks at the beginning, full
+/// chunks at the end
+chunks: LinkedList,
 /// Offsets of each component array in chunk buffer
 offsets: []u16,
 /// Component sizes
 sizes: []u16,
 /// Bitmask of components present in archetype
 mask: Mask,
+/// Capacity of one chunk. Stored here to save space
 capacity: u16,
 
 const Self = @This();
@@ -26,7 +26,7 @@ pub const Chunk = struct {
     header: Header,
     buffer: [buffer_size]u8 align(@alignOf(u32)),
 
-    const buffer_size: usize = std.heap.pageSize() - @sizeOf(Header);
+    const buffer_size: usize = std.heap.page_size_min - @sizeOf(Header);
     const Header = struct {
         node: LinkedList.Node,
         arch: u16,
@@ -55,8 +55,21 @@ pub const Chunk = struct {
         return self.header.len;
     }
 
+    pub fn isEmpty(self: *const @This()) bool {
+        return self.header.len <= 0;
+    }
+
     pub fn isFull(self: *const @This(), capacity: u16) bool {
         return self.header.len >= capacity;
+    }
+
+    pub fn next(self: *const @This()) ?*@This() {
+        return .from(self.header.node.next);
+    }
+
+    pub fn from(node: ?*LinkedList.Node) ?*@This() {
+        const header: *Chunk.Header = @fieldParentPtr("node", node orelse return null);
+        return @fieldParentPtr("header", header);
     }
 };
 
@@ -100,8 +113,7 @@ pub fn init(self: *Self, mask: Mask, alloc: Allocator) !void {
     }
 
     self.* = .{
-        .free_chunks = .{},
-        .full_chunks = .{},
+        .chunks = .{},
         .offsets = offsets,
         .sizes = sizes,
         .mask = mask,
@@ -109,25 +121,14 @@ pub fn init(self: *Self, mask: Mask, alloc: Allocator) !void {
     };
 }
 
-/// Deinits owned memory only. Pool of chunks must be
-/// deinitialized separately.
 pub fn deinit(self: *Self, alloc: Allocator) void {
     self.offsets.len *= 2; // Allocated in same buffer as sizes
     alloc.free(self.offsets);
 
     // TODO: Actual chunk allocator
-    var node = self.free_chunks.first;
-    while (node) |n| {
-        node = n.next;
-        const header: *Chunk.Header = @fieldParentPtr("node", n);
-        const chunk: *Chunk = @fieldParentPtr("header", header);
-        alloc.destroy(chunk);
-    }
-    node = self.full_chunks.first;
-    while (node) |n| {
-        node = n.next;
-        const header: *Chunk.Header = @fieldParentPtr("node", n);
-        const chunk: *Chunk = @fieldParentPtr("header", header);
+    var next: ?*Chunk = .from(self.chunks.first);
+    while (next) |chunk| {
+        next = chunk.next();
         alloc.destroy(chunk);
     }
 }
@@ -142,6 +143,11 @@ pub fn hasExact(self: *const Self, Row: type) bool {
 
 pub fn hasAll(self: *const Self, Row: type) bool {
     return self.mask.supersetOf(rtti.maskFromType(Row));
+}
+
+pub fn isEmpty(self: *const Self) bool {
+    const chunk = Chunk.from(self.chunks.first) orelse return true;
+    return chunk.isEmpty();
 }
 
 /// Computes offsets and sizes for desired components
@@ -169,15 +175,13 @@ pub fn get(self: *const Self, chunk: *Chunk, row: u16, Row: type) rtti.PtrsTo(Ro
     self.gatherRtti(Row, &offsets, &sizes);
 
     // Calculate pointers
-    // const base: Vec = @splat(@intFromPtr(&chunk.buffer));
-    // const ptrs: Vec = base + offsets + sizes * @as(Vec, @splat(row));
+    const base: Vec = @splat(@intFromPtr(&chunk.buffer));
+    const ptrs: Vec = base + offsets + sizes * @as(Vec, @splat(row));
 
     // Noop, just cast the pointers
     var res: rtti.PtrsTo(Row) = undefined;
-    inline for (comptime std.meta.fieldNames(Row), 0..) |name, i| {
-        // @field(res, name) = @ptrFromInt(ptrs[i]);
-        @field(res, name) = @ptrCast(@alignCast(&chunk.buffer[offsets[i] + sizes[i] * row]));
-    }
+    inline for (comptime std.meta.fieldNames(Row), 0..) |name, i|
+        @field(res, name) = @ptrFromInt(ptrs[i]);
 
     return res;
 }
@@ -193,22 +197,22 @@ pub fn getComp(self: *const Self, chunk: *Chunk, row: u16, T: type) *T {
 }
 
 pub fn new(self: *Self, alloc: Allocator, arch_i: u16, entry: u32) !NewResult {
-    if (self.free_chunks.first) |node| {
-        const header: *Chunk.Header = @fieldParentPtr("node", node);
-        const chunk: *Chunk = @fieldParentPtr("header", header);
-        const i = chunk.new(entry, self.capacity);
-        if (chunk.isFull(self.capacity)) {
-            _ = self.free_chunks.popFirst();
-            self.full_chunks.prepend(node);
+    if (Chunk.from(self.chunks.first)) |chunk| {
+        if (!chunk.isFull(self.capacity)) {
+            const i = chunk.new(entry, self.capacity);
+            if (chunk.isFull(self.capacity)) {
+                _ = self.chunks.popFirst();
+                self.chunks.append(&chunk.header.node);
+            }
+            return .{ chunk, i };
         }
-        return .{ chunk, i };
-    } else {
-        // TODO: Actual chunk allocator
-        const chunk = try alloc.create(Chunk);
-        chunk.init(arch_i);
-        self.free_chunks.prepend(&chunk.header.node);
-        return .{ chunk, chunk.new(entry, self.capacity) };
     }
+
+    // TODO: Actual chunk allocator
+    const chunk = try alloc.create(Chunk);
+    chunk.init(arch_i);
+    self.chunks.prepend(&chunk.header.node);
+    return .{ chunk, chunk.new(entry, self.capacity) };
 }
 
 pub fn create(self: *Self, alloc: Allocator, row: anytype, arch_i: u16, entry: u32) !NewResult {
@@ -260,8 +264,8 @@ pub fn delete(self: *Self, chunk: *Chunk, i: u32) ?u32 {
     // If deleting from a full chunk, move from full chunk list to free chunk list
     const should_move = chunk.isFull(self.capacity);
     defer if (should_move) {
-        self.full_chunks.remove(&chunk.header.node); // TODO: Oh, so this is why I need a doubly linked list...
-        self.free_chunks.prepend(&chunk.header.node);
+        self.chunks.remove(&chunk.header.node);
+        self.chunks.append(&chunk.header.node);
     };
 
     if (i != len) {
@@ -293,7 +297,8 @@ pub fn Iterator(Row: type) type {
         ptrs: Vec,
         sizes: Vec,
         chunk: ?*Chunk,
-        len: usize,
+        row: u16,
+        len: u16,
 
         const Vec = @Vector(std.meta.fields(T).len, usize);
         const T = rtti.PtrsTo(Row);
@@ -306,21 +311,41 @@ pub fn Iterator(Row: type) type {
                 .offsets = undefined,
                 .ptrs = undefined,
                 .sizes = undefined,
-                .chunk = null,
+                .chunk = .from(arch.chunks.first),
+                .row = 0,
+                .len = undefined,
             };
 
             arch.gatherRtti(Row, &self.offsets, &self.sizes);
+            if (self.chunk) |chunk| {
+                const base: Vec = @splat(@intFromPtr(&chunk.buffer));
+                self.ptrs = self.offsets + base;
+                self.len = chunk.header.len;
+            }
 
             return self;
         }
 
         pub fn next(self: *@This()) ?T {
-            if (self.len <= 0) return null;
-            self.len -= 1;
+            var chunk = self.chunk orelse return null;
+            // TODO: Need to have a dedicated chunk pool to avoid empty chunks completely?
+            if (self.row >= self.len) {
+                while (true) {
+                    self.chunk = chunk.next();
+                    chunk = self.chunk orelse return null;
+                    if (!chunk.isEmpty()) break;
+                }
+
+                // Reset iterator
+                self.row = 0;
+                self.len = chunk.header.len;
+                const base: Vec = @splat(@intFromPtr(&chunk.buffer));
+                self.ptrs = self.offsets + base;
+            }
+
+            self.row += 1;
             defer self.ptrs += self.sizes;
 
-            // This should compile to a noop, just return the offsets directly
-            // TODO: Verify
             var item: T = undefined;
             inline for (comptime std.meta.fieldNames(T), 0..) |name, i|
                 @field(item, name) = @ptrFromInt(self.ptrs[i]);
