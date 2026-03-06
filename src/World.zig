@@ -41,6 +41,8 @@ free_entry: ?u32,
 const Self = @This();
 pub const Options = struct {
     page_alloc: Allocator = std.heap.page_allocator,
+    // TODO: Implement
+    chunk_size: usize = std.heap.pageSize(),
 };
 
 pub fn init(alloc: Allocator, opts: Options) Self {
@@ -262,14 +264,4 @@ pub fn Iterator(Row: type) type {
             } else null;
         }
     };
-}
-
-pub inline fn each(self: *Self, T: type, f: fn (*T) void) void {
-    for (self.archetypes.values()) |*arch| {
-        if (arch.hasExact(T)) {
-            for (arch.values(T)) |*row| {
-                f(row);
-            }
-        }
-    }
 }
