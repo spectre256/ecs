@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Chunk = @import("Chunk.zig");
 const List = std.DoublyLinkedList;
+const Chunk = @import("Chunk.zig");
 
 free_chunks: List,
 page_alloc: Allocator,

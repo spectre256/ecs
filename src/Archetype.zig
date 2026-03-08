@@ -78,11 +78,8 @@ pub fn deinit(self: *Self, pool: *ChunkPool, alloc: Allocator) void {
     self.offsets.len *= 2; // Allocated in same buffer as sizes
     alloc.free(self.offsets);
 
-    var next: ?*Chunk = .fromOpt(self.chunks.first);
-    while (next) |chunk| {
-        next = chunk.next();
-        pool.destroy(chunk);
-    }
+    while (self.chunks.popFirst()) |node|
+        pool.destroy(.from(node));
 }
 
 pub fn has(self: *const Self, T: type) bool {
@@ -212,14 +209,14 @@ pub fn delete(self: *Self, pool: *ChunkPool, chunk: *Chunk, i: u32) ?u32 {
     const id = chunk.ids()[len];
 
     // If the chunk is empty after deletion, free it
-    // If deleting from a full chunk, move from full chunk list to free chunk list
+    // If deleting from a full chunk, move to beginning of chunk list
     const should_move = chunk.isFull(self.capacity);
-    defer if (chunk.isEmpty()) {
+    defer if (len == 0) {
         self.chunks.remove(&chunk.header.node);
         pool.destroyWithReuse(chunk);
     } else if (should_move) {
         self.chunks.remove(&chunk.header.node);
-        self.chunks.append(&chunk.header.node);
+        self.chunks.prepend(&chunk.header.node);
     };
 
     if (i != len) {

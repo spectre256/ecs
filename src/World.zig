@@ -31,6 +31,7 @@ pub const EntityEntry = struct {
     },
 };
 
+// TODO: This stores the masks as keys, right? Can I remove the mask from Archetype then?
 archetypes: Map(Mask, Archetype),
 entries: Array(EntityEntry),
 alloc: Allocator,
