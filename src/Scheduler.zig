@@ -5,6 +5,7 @@ const Map = std.AutoHashMapUnmanaged;
 const List = std.DoublyLinkedList;
 const Atomic = std.atomic.Value;
 const Thread = std.Thread;
+const AtomicDeque = @import("AtomicDeque.zig");
 const World = @import("World.zig");
 const Chunk = @import("Chunk.zig");
 const rtti = @import("rtti.zig");
@@ -345,47 +346,6 @@ const Worker = struct {
     pub fn run(self: *@This(), scheduler: *Self) void {
         _ = self;
         _ = scheduler;
-    }
-};
-
-const AtomicDeque = struct {
-    first: Atomic(?*List.Node),
-    last: Atomic(?*List.Node),
-
-    pub const empty: @This() = .{
-        .first = .init(null),
-        .last = .init(null),
-    };
-
-    pub fn from(list: List) @This() {
-        return .{
-            .first = .init(list.first),
-            .last = .init(list.last),
-        };
-    }
-
-    pub fn popFront(self: *@This()) ?*List.Node {
-        var first = self.first.load(.acquire) orelse return null;
-
-        while (self.first.cmpxchgWeak(first, first.next, .release, .monotonic)) |new_first|
-            first = new_first orelse return null;
-
-        if (first.next == null)
-            self.last.store(null, .release);
-
-        return first;
-    }
-
-    pub fn popBack(self: *@This()) ?*List.Node {
-        var last = self.last.load(.acquire) orelse return null;
-
-        while (self.last.cmpxchgWeak(last, last.prev, .release, .monotonic)) |new_last|
-            last = new_last orelse return null;
-
-        if (last.prev == null)
-            self.first.store(null, .release);
-
-        return last;
     }
 };
 
