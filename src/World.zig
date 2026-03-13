@@ -266,3 +266,18 @@ pub fn Iterator(Row: type) type {
         }
     };
 }
+
+
+const testing = std.testing;
+const expect = testing.expect;
+const expectEqual = testing.expectEqual;
+
+pub fn expectGet(self: *Self, id: EntityID, expected: anytype) !void {
+    const actual = try self.get(id, @TypeOf(expected));
+    inline for (comptime std.meta.fieldNames(@TypeOf(expected))) |name|
+        try expectEqual(@field(expected, name), @field(actual, name).*);
+}
+
+pub fn expectHas(self: *Self, id: EntityID, T: type) !void {
+    try expect(self.has(id, T));
+}

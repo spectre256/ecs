@@ -1,6 +1,7 @@
 const std = @import("std");
 const Alignment = std.mem.Alignment;
-const typeId = @import("typeid.zig").typeId;
+// Reexport
+pub const typeId = @import("typeid.zig").typeId;
 
 pub const num_comps: usize = 64;
 pub var type_infos: [num_comps]struct {

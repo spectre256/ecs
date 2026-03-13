@@ -17,7 +17,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    exe_mod.addImport("ecs_lib", lib_mod);
+    exe_mod.addImport("ecs", lib_mod);
 
     const lib = b.addLibrary(.{
         .linkage = .static,

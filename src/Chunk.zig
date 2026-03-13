@@ -56,3 +56,22 @@ pub fn from(node: *List.Node) *Self {
 pub fn fromOpt(node: ?*List.Node) ?*Self {
     return .from(node orelse return null);
 }
+
+pub fn iter(self: *@This(), Row: type) Iterator(Row) {
+    return .init(self);
+}
+
+// TODO: Implement
+pub fn Iterator(Row: type) type {
+    return struct {
+        pub fn init(chunk: *Self) @This() {
+            _ = chunk;
+            return .{};
+        }
+
+        pub fn next(self: *@This()) ?Row {
+            _ = self;
+            return null;
+        }
+    };
+}

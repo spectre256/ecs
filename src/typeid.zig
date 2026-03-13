@@ -22,10 +22,11 @@ pub fn typeId(T: type) usize {
 }
 
 const expect = std.testing.expect;
+const expectEqual = std.testing.expectEqual;
 
 test "basic types" {
-    try expect(typeId(u8) == 0);
-    try expect(typeId(u16) == 1);
+    try expectEqual(0, typeId(u8));
+    try expectEqual(1, typeId(u16));
     try expect(typeId(u8) == typeId(u8));
     try expect(typeId(u16) == typeId(u16));
     try expect(typeId(u8) != typeId(u16));
