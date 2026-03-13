@@ -43,8 +43,9 @@ const RwMask = struct {
         var self: @This() = .empty;
 
         inline for (std.meta.fields(Row)) |field| {
-            const i = rtti.typeId(field.type);
-            if (@typeInfo(field.type).pointer.is_const) self.read.set(i) else self.write.set(i);
+            const info = @typeInfo(field.type);
+            const i = rtti.typeId(info.pointer.child);
+            if (info.pointer.is_const) self.read.set(i) else self.write.set(i);
         }
 
         return self;
@@ -53,14 +54,15 @@ const RwMask = struct {
 
 const System = struct {
     rw: RwMask,
-    // TODO: Implement
     ctx: ?*anyopaque = null,
     vtable: VTable,
     prev_count: Atomic(u32),
+    // TODO: Do I really need this? Perhaps just a count for sorting
     nexts: Array(*System),
     // For graph building and iteration
     node: List.Node,
-    height: usize,
+    // For debugging
+    name: [:0]const u8,
 
     pub const VTable = struct {
         init: ?*const fn () *anyopaque,
@@ -108,31 +110,38 @@ const Level = struct {
         .rw = .empty,
         .systems = .empty,
     };
+
+    /// Sort in descending order based on fanout
+    pub fn sort(self: *@This()) void {
+        std.sort.insertion(*System, self.systems.items, {}, struct {
+            pub fn lessThan(_: void, a: *System, b: *System) bool {
+                return a.nexts.items.len > b.nexts.items.len; // Greater than to sort descending
+            }
+        }.lessThan);
+    }
 };
 
 pub const Graph = struct {
     levels: Array(Level),
-    system_levels: Map(*System, usize),
     alloc: Allocator,
 
     pub const ScheduleOptions = struct {
+        name: ?[:0]const u8 = null,
         /// Systems that must be run before the current one
-        before: []*System = &.{},
+        before: []const *System = &.{},
         /// Systems that must be run after the current one
-        after: []*System = &.{},
+        after: []const *System = &.{},
     };
 
     pub fn init(alloc: Allocator) @This() {
         return .{
             .levels = .empty,
-            .system_levels = .empty,
             .alloc = alloc,
         };
     }
 
     pub fn deinit(self: *@This()) void {
         defer self.levels.deinit(self.alloc);
-        self.system_levels.deinit(self.alloc);
 
         for (self.levels.items) |*level| {
             for (level.systems.items) |system| {
@@ -148,17 +157,18 @@ pub const Graph = struct {
         return self.scheduleOpts(ctx_or_fn, extra_args, .{});
     }
 
-    pub fn scheduleBefore(self: *@This(), ctx_or_fn: anytype, extra_args: anytype, before: []*System) !*System {
-        return self.scheduleOpts(ctx_or_fn, extra_args, .{ .before = before });
+    /// Schedule a system before other systems
+    pub fn scheduleBefore(self: *@This(), ctx_or_fn: anytype, extra_args: anytype, after: []const *System) !*System {
+        return self.scheduleOpts(ctx_or_fn, extra_args, .{ .after = after });
     }
 
-    pub fn scheduleAfter(self: *@This(), ctx_or_fn: anytype, extra_args: anytype, after: []*System) !*System {
-        return self.scheduleOpts(ctx_or_fn, extra_args, .{ .after = after });
+    /// Schedule a system after other systems
+    pub fn scheduleAfter(self: *@This(), ctx_or_fn: anytype, extra_args: anytype, before: []const *System) !*System {
+        return self.scheduleOpts(ctx_or_fn, extra_args, .{ .before = before });
     }
 
     // TODO: Add real type for extra_args
     // TODO: Validate types
-    // TODO: Auto scheduling based on iter type?
     pub fn scheduleOpts(self: *@This(), ctx_or_fn: anytype, extra_args: anytype, opts: ScheduleOptions) !*System {
         const Impl = getImpl(ctx_or_fn, extra_args);
 
@@ -169,7 +179,7 @@ pub const Graph = struct {
             .prev_count = .init(0),
             .nexts = try .initCapacity(self.alloc, opts.after.len),
             .node = .{},
-            .height = undefined,
+            .name = opts.name orelse @typeName(Impl.Row),
         };
 
         try self.addSystem(system, opts);
@@ -237,13 +247,13 @@ pub const Graph = struct {
         // potential levels
         var min_level: usize = 0;
         for (opts.before) |before_system| {
-            const i = self.system_levels.get(before_system) orelse return error.InvalidBeforeSystem;
+            const i = self.findSystemLevel(before_system) orelse return error.InvalidBeforeSystem;
             min_level = @max(min_level, i + 1);
         }
 
         var max_level: usize = self.levels.items.len;
         for (opts.after) |after_system| {
-            const i = self.system_levels.get(after_system) orelse return error.InvalidAfterSystem;
+            const i = self.findSystemLevel(after_system) orelse return error.InvalidAfterSystem;
             max_level = @min(max_level, i);
         }
 
@@ -263,24 +273,31 @@ pub const Graph = struct {
         try self.addToLevel(level_i, system);
     }
 
+    fn findSystemLevel(self: *@This(), system: *System) ?usize {
+        for (self.levels.items) |*level| {
+            if (!system.rw.conflicts(system.rw)) continue;
+
+            if (std.mem.indexOfScalar(*System, level.systems.items, system)) |i| return i;
+        } else return null;
+    }
+
     fn addToLevel(self: *@This(), level_i: usize, system: *System) !void {
         // Add to level and update pointers
         const level = &self.levels.items[level_i];
         try level.systems.append(self.alloc, system);
-        try self.system_levels.put(self.alloc, system, level_i);
         level.rw = level.rw.unionWith(system.rw);
 
         // Add system dependencies
-        for (0..level_i) |i| {
-            for (self.levels.items[i].systems.items) |before_system| {
+        for (self.levels.items[0..level_i]) |*before_level| {
+            for (before_level.systems.items) |before_system| {
                 if (system.rw.conflicts(before_system.rw))
                     try before_system.append(self.alloc, system);
             }
         }
 
         // Add dependent systems
-        for (level_i..self.levels.items.len) |i| {
-            for (self.levels.items[i].systems.items) |after_system| {
+        for (self.levels.items[level_i..][1..]) |*after_level| {
+            for (after_level.systems.items) |after_system| {
                 if (system.rw.conflicts(after_system.rw))
                     try system.append(self.alloc, after_system);
             }
@@ -288,33 +305,24 @@ pub const Graph = struct {
     }
 
     // Topologically sorts system graph. Moves ownership to compiled graph
-    // TODO: Update to work with levels and remove superfluous connections
+    // TODO: Remove superfluous connections
     pub fn build(self: *@This()) CompiledGraph {
-        // Free unnecessary data
-        defer self.levels.deinit(self.alloc);
-        defer for (self.levels.items) |*level| level.systems.deinit(self.alloc);
-        self.system_levels.deinit(self.alloc);
+        // Free unnecessary data. Levels must be cleared so as to avoid double free on error
+        defer self.levels.clearAndFree(self.alloc);
+        defer for (self.levels.items) |*level|
+            level.systems.deinit(self.alloc);
 
         var systems: List = .{};
 
         // In order traversal, each level sorted by fanout size
         // This should guarantee optimal scheduling order
         for (self.levels.items) |*level| {
-            sortSystems(level.systems.items);
+            level.sort();
             for (level.systems.items) |system|
                 systems.append(&system.node);
         }
 
         return .{ .systems = systems };
-    }
-
-    fn sortSystems(systems: []*System) void {
-        std.sort.insertion(*System, systems, {}, struct {
-            pub fn lessThan(_: void, a: *System, b: *System) bool {
-                // Sort in descending order based on fanout
-                return a.nexts.items.len > b.nexts.items.len;
-            }
-        }.lessThan);
     }
 };
 
@@ -407,6 +415,7 @@ pub fn run(self: *Self, graph: CompiledGraph) !void {
     var workers = try self.alloc.alloc(Worker, thread_count);
     defer self.alloc.free(threads);
 
+    // TODO: Error handling instead of .?
     self.system = .init(.from(graph.systems.first.?));
 
     for (0..thread_count) |i| {
@@ -424,6 +433,8 @@ pub fn runSingleThreaded(self: *Self) void {
 
 const testing = std.testing;
 const expectEqual = testing.expectEqual;
+const expectEqualSlices = testing.expectEqualSlices;
+
 const tests = struct {
     const Position = struct {
         x: f32,
@@ -497,19 +508,81 @@ fn setup() !World {
 
 fn expectOrder(expected: []const *const System, graph: *const CompiledGraph) !void {
     var next: ?*System = .fromOpt(graph.systems.first);
-    var i: usize = 0;
+    var actual: Array(*const System) = .empty;
+    defer actual.deinit(testing.allocator);
 
-    while (next) |actual| : ({
-        next = actual.next();
-        i += 1;
-    }) {
-        try expectEqual(expected[i], actual);
+    while (next) |system| : (next = system.next())
+        try actual.append(testing.allocator, system);
+
+    errdefer {
+        for (actual.items) |system| {
+            std.debug.print("{s}: &.{{ .read = {}, .write = {} }}, &.{{\n", .{ system.name, system.rw.read.mask, system.rw.write.mask });
+            for (system.nexts.items) |next_system|
+                std.debug.print("    {s}: &.{{ .read = {}, .write = {} }},\n", .{ next_system.name, next_system.rw.read.mask, next_system.rw.write.mask });
+            std.debug.print("}}\n", .{});
+        }
     }
 
-    // Ensure every element was checked
-    try expectEqual(expected.len, i);
+    try expectEqualSlices(*const System, expected, actual.items);
 }
 
+fn expectLevels(expected: []const []const *const System, graph: *const Graph) !void {
+    errdefer {
+        var lookup: [rtti.num_comps][]const u8 = @splat("");
+        inline for (&.{ tests.Position, tests.Velocity, tests.Acceleration }) |T|
+            lookup[rtti.typeId(T)] = @typeName(T);
+
+        std.debug.print("expected levels: &.{{\n", .{});
+        for (expected) |row| {
+            std.debug.print("    &.{{\n", .{});
+            for (row) |system| {
+                std.debug.print("        {*}{{ .read = &.{{ ", .{system});
+                var iter = system.rw.read.iterator(.{});
+                while (iter.next()) |i|
+                    std.debug.print("{s}, ", .{lookup[i]});
+
+                std.debug.print("}}, .write = &.{{ ", .{});
+                iter = system.rw.write.iterator(.{});
+                while (iter.next()) |i|
+                    std.debug.print("{s}, ", .{lookup[i]});
+
+                std.debug.print("}},\n", .{});
+            }
+            std.debug.print("    }},\n", .{});
+        }
+        std.debug.print("}}\n", .{});
+
+        std.debug.print("actual levels: &.{{\n", .{});
+        for (graph.levels.items) |*level| {
+            std.debug.print("    &.{{\n", .{});
+            for (level.systems.items) |system| {
+                std.debug.print("        {*}{{ .read = &.{{ ", .{system});
+                var iter = system.rw.read.iterator(.{});
+                while (iter.next()) |i|
+                    std.debug.print("{s}, ", .{lookup[i]});
+
+                std.debug.print("}}, .write = &.{{ ", .{});
+                iter = system.rw.write.iterator(.{});
+                while (iter.next()) |i|
+                    std.debug.print("{s}, ", .{lookup[i]});
+
+                std.debug.print("}},\n", .{});
+            }
+            std.debug.print("    }},\n", .{});
+        }
+        std.debug.print("}}\n", .{});
+    }
+
+    if (expected.len != graph.levels.items.len)
+        return error.DifferentColLengths;
+
+    for (graph.levels.items, 0..) |*level, i| {
+        // Prematurely sort to test ordering
+        level.sort();
+
+        try expectEqualSlices(*const System, expected[i], level.systems.items);
+    }
+}
 
 test "simple graph" {
     var ecs: World = .init(testing.allocator, .{});
@@ -526,11 +599,9 @@ test "simple graph" {
     defer compiled.deinit(scheduler.alloc);
 
     try expectOrder(&.{ move_sys, acc_sys }, &compiled);
-
-    // try scheduler.run(graph);
 }
 
-test "advanced graph" {
+test "complex graph" {
     var ecs = try setup();
     defer ecs.deinit();
 
@@ -540,10 +611,24 @@ test "advanced graph" {
     var graph: Graph = scheduler.createGraph();
     errdefer graph.deinit();
 
-    const move_sys = try graph.schedule(tests.movement, .{});
-    const acc_sys = try graph.schedule(tests.accelerate, .{});
+    const move_sys = try graph.scheduleOpts(tests.movement, .{}, .{ .name = "movement" });
+    const acc_sys = try graph.scheduleOpts(tests.accelerate, .{}, .{ .name = "acceleration" });
+    const norm_pos_sys = try graph.scheduleOpts(tests.normalizePos, .{}, .{
+        .name = "normalize_position",
+        .before = &.{move_sys},
+    });
+    const norm_vel_sys = try graph.scheduleOpts(tests.normalizeVel, .{}, .{
+        .name = "normalize_velocity",
+        .before = &.{acc_sys},
+    });
+    try expectLevels(&.{
+        &.{ move_sys },
+        &.{ acc_sys, norm_pos_sys },
+        &.{ norm_vel_sys },
+    }, &graph);
+
     var compiled = graph.build();
     defer compiled.deinit(scheduler.alloc);
 
-    try expectOrder(&.{ move_sys, acc_sys }, &compiled);
+    try expectOrder(&.{ move_sys, acc_sys, norm_pos_sys, norm_vel_sys }, &compiled);
 }
