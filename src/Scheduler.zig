@@ -5,13 +5,14 @@ const Map = std.AutoHashMapUnmanaged;
 const List = std.DoublyLinkedList;
 const Atomic = std.atomic.Value;
 const Thread = std.Thread;
-const AtomicDeque = @import("AtomicDeque.zig");
+const Queue = @import("Queue.zig");
 const World = @import("World.zig");
 const Chunk = @import("Chunk.zig");
 const rtti = @import("rtti.zig");
 const Mask = rtti.Mask;
 
-system: Atomic(*System),
+systems: CompiledGraph.Iterator,
+arch: Atomic(u16),
 workers: []Worker,
 alloc: Allocator,
 ecs: *World,
@@ -28,9 +29,9 @@ const RwMask = struct {
     };
 
     pub fn conflicts(self: @This(), other: @This()) bool {
-        const wr_conflict = self.write.intersectWith(other.write.unionWith(other.read)).count() > 0;
-        const rw_conflict = other.write.intersectWith(self.write.unionWith(self.read)).count() > 0;
-        return wr_conflict or rw_conflict;
+        const w_conflict = !self.write.intersectWith(other.write.unionWith(other.read)).eql(.initEmpty());
+        const r_conflict = !self.read.intersectWith(other.write).eql(.initEmpty());
+        return w_conflict or r_conflict;
     }
 
     pub fn unionWith(self: @This(), other: @This()) @This() {
@@ -51,17 +52,18 @@ const RwMask = struct {
 
         return self;
     }
+
+    pub fn toMask(self: @This()) Mask {
+        return self.read.unionWith(self.write);
+    }
 };
 
 const System = struct {
     rw: RwMask,
     ctx: ?*anyopaque = null,
     vtable: VTable,
-    prev_count: Atomic(u32),
-    // TODO: Do I really need this? Perhaps just a count for sorting
-    nexts: Array(*System),
-    // For graph building and iteration
-    node: List.Node,
+    prevs: []const *System,
+    nexts: []const *System,
     // For debugging
     name: [:0]const u8,
 
@@ -70,23 +72,6 @@ const System = struct {
         deinit: ?*const fn (?*anyopaque) void,
         run_chunk: *const fn (?*anyopaque, *Chunk) void,
     };
-
-    pub fn next(self: *@This()) ?*@This() {
-        return .fromOpt(self.node.next);
-    }
-
-    pub fn from(node: *List.Node) *@This() {
-        return @fieldParentPtr("node", node);
-    }
-
-    pub fn fromOpt(node: ?*List.Node) ?*@This() {
-        return .from(node orelse return null);
-    }
-
-    pub fn append(self: *@This(), alloc: Allocator, other: *@This()) !void {
-        try self.nexts.append(alloc, other);
-        other.prev_count.raw += 1;
-    }
 
     pub fn init(self: *@This()) void {
         if (self.vtable.init) |init_fn|
@@ -103,9 +88,12 @@ const System = struct {
     }
 };
 
+/// Set of systems to be run in parallel
 const Level = struct {
     rw: RwMask,
     systems: Array(*System),
+    // Systems left to run before moving on to next level
+    remaining: Atomic(usize) = undefined,
 
     pub const empty: @This() = .{
         .rw = .empty,
@@ -116,22 +104,23 @@ const Level = struct {
     pub fn sort(self: *@This()) void {
         std.sort.insertion(*System, self.systems.items, {}, struct {
             pub fn lessThan(_: void, a: *System, b: *System) bool {
-                return a.nexts.items.len > b.nexts.items.len; // Greater than to sort descending
+                return a.nexts.len > b.nexts.len; // Greater than to sort descending
             }
         }.lessThan);
     }
 };
 
+/// DAG of systems to run
 pub const Graph = struct {
     levels: Array(Level),
     alloc: Allocator,
 
     pub const ScheduleOptions = struct {
         name: ?[:0]const u8 = null,
-        /// Systems that must be run before the current one
-        before: []const *System = &.{},
-        /// Systems that must be run after the current one
+        /// Must run after these systems
         after: []const *System = &.{},
+        /// Must run before these systems
+        before: []const *System = &.{},
     };
 
     pub fn init(alloc: Allocator) @This() {
@@ -142,16 +131,14 @@ pub const Graph = struct {
     }
 
     pub fn deinit(self: *@This()) void {
-        defer self.levels.deinit(self.alloc);
-
         for (self.levels.items) |*level| {
-            for (level.systems.items) |system| {
-                system.nexts.deinit(self.alloc);
+            for (level.systems.items) |system|
                 self.alloc.destroy(system);
-            }
 
             level.systems.deinit(self.alloc);
         }
+
+        self.levels.deinit(self.alloc);
     }
 
     pub fn schedule(self: *@This(), ctx_or_fn: anytype, extra_args: anytype) !*System {
@@ -159,13 +146,13 @@ pub const Graph = struct {
     }
 
     /// Schedule a system before other systems
-    pub fn scheduleBefore(self: *@This(), ctx_or_fn: anytype, extra_args: anytype, after: []const *System) !*System {
-        return self.scheduleOpts(ctx_or_fn, extra_args, .{ .after = after });
+    pub fn scheduleBefore(self: *@This(), ctx_or_fn: anytype, extra_args: anytype, before: []const *System) !*System {
+        return self.scheduleOpts(ctx_or_fn, extra_args, .{ .before = before });
     }
 
     /// Schedule a system after other systems
-    pub fn scheduleAfter(self: *@This(), ctx_or_fn: anytype, extra_args: anytype, before: []const *System) !*System {
-        return self.scheduleOpts(ctx_or_fn, extra_args, .{ .before = before });
+    pub fn scheduleAfter(self: *@This(), ctx_or_fn: anytype, extra_args: anytype, after: []const *System) !*System {
+        return self.scheduleOpts(ctx_or_fn, extra_args, .{ .after = after });
     }
 
     // TODO: Add real type for extra_args
@@ -177,13 +164,12 @@ pub const Graph = struct {
         system.* = .{
             .rw = .fromType(Impl.Row),
             .vtable = Impl.vtable,
-            .prev_count = .init(0),
-            .nexts = try .initCapacity(self.alloc, opts.after.len),
-            .node = .{},
-            .name = opts.name orelse @typeName(Impl.Row),
+            .prevs = opts.after,
+            .nexts = opts.before,
+            .name = Impl.name,
         };
 
-        try self.addSystem(system, opts);
+        try self.addSystem(system);
 
         return system;
     }
@@ -194,13 +180,14 @@ pub const Graph = struct {
             .type => struct {
                 const Context = ctx_or_fn;
                 pub const Row = Context.Row;
-                const has_ctx = @typeInfo(@TypeOf(Context.init)).@"fn".return_type != null;
-
+                pub const name = if (@hasDecl(Context, "name")) Context.name else @typeName(Row);
                 pub const vtable: System.VTable = .{
                     .init = @This().init,
                     .deinit = @This().deinit,
                     .run_chunk = runChunk,
                 };
+
+                const has_ctx = @typeInfo(@TypeOf(Context.init)).@"fn".return_type != null;
 
                 pub fn init() !?*anyopaque {
                     return if (has_ctx) @ptrCast(Context.init()) else null;
@@ -224,6 +211,7 @@ pub const Graph = struct {
             },
             .@"fn" => struct {
                 pub const Row = info.@"fn".params[0].type.?;
+                pub const name = @typeName(Row);
                 pub const vtable: System.VTable = .{
                     .init = null,
                     .deinit = null,
@@ -243,17 +231,18 @@ pub const Graph = struct {
 
     // TODO: Might be impossible to schedule based on order that before/after systems got scheduled
     // TODO: Level reordering when possible?
-    fn addSystem(self: *@This(), system: *System, opts: ScheduleOptions) !void {
+    // TODO: Coffman-Graham algorithm, offline graph creation
+    fn addSystem(self: *@This(), system: *System) !void {
         // Find level of each before and after system, computing range of
         // potential levels
         var min_level: usize = 0;
-        for (opts.before) |before_system| {
+        for (system.prevs) |before_system| {
             const i = self.findSystemLevel(before_system) orelse return error.InvalidBeforeSystem;
             min_level = @max(min_level, i + 1);
         }
 
         var max_level: usize = self.levels.items.len;
-        for (opts.after) |after_system| {
+        for (system.nexts) |after_system| {
             const i = self.findSystemLevel(after_system) orelse return error.InvalidAfterSystem;
             max_level = @min(max_level, i);
         }
@@ -266,86 +255,141 @@ pub const Graph = struct {
         const level_i = blk: for (min_level..max_level) |i| {
             if (!system.rw.conflicts(self.levels.items[i].rw)) break :blk i;
         } else {
-            const i = self.levels.items.len;
-            try self.levels.append(self.alloc, .empty);
-            break :blk i;
+            try self.levels.insert(self.alloc, max_level, .empty);
+            break :blk max_level;
         };
 
         try self.addToLevel(level_i, system);
     }
 
+    // Returns index of level where system is present
     fn findSystemLevel(self: *@This(), system: *System) ?usize {
-        for (self.levels.items) |*level| {
-            if (!system.rw.conflicts(system.rw)) continue;
+        for (self.levels.items, 0..) |*level, i| {
+            if (!system.rw.conflicts(level.rw)) continue;
 
-            if (std.mem.indexOfScalar(*System, level.systems.items, system)) |i| return i;
+            if (std.mem.indexOfScalar(*System, level.systems.items, system)) |_| return i;
         } else return null;
     }
 
     fn addToLevel(self: *@This(), level_i: usize, system: *System) !void {
-        // Add to level and update pointers
         const level = &self.levels.items[level_i];
         try level.systems.append(self.alloc, system);
         level.rw = level.rw.unionWith(system.rw);
-
-        // Add system dependencies
-        for (self.levels.items[0..level_i]) |*before_level| {
-            for (before_level.systems.items) |before_system| {
-                if (system.rw.conflicts(before_system.rw))
-                    try before_system.append(self.alloc, system);
-            }
-        }
-
-        // Add dependent systems
-        for (self.levels.items[level_i..][1..]) |*after_level| {
-            for (after_level.systems.items) |after_system| {
-                if (system.rw.conflicts(after_system.rw))
-                    try system.append(self.alloc, after_system);
-            }
-        }
     }
 
     // Topologically sorts system graph. Moves ownership to compiled graph
-    // TODO: Remove superfluous connections
     pub fn build(self: *@This()) CompiledGraph {
-        // Free unnecessary data. Levels must be cleared so as to avoid double free on error
-        defer self.levels.clearAndFree(self.alloc);
-        defer for (self.levels.items) |*level|
-            level.systems.deinit(self.alloc);
-
-        var systems: List = .{};
-
-        // In order traversal, each level sorted by fanout size
+        // Sort each level sorted by fanout size
         // This should guarantee optimal scheduling order
-        for (self.levels.items) |*level| {
+        for (self.levels.items) |*level|
             level.sort();
-            for (level.systems.items) |system|
-                systems.append(&system.node);
-        }
 
-        return .{ .systems = systems };
+        return .{
+            .levels = self.levels,
+            .alloc = self.alloc,
+        };
     }
 };
 
 pub const CompiledGraph = struct {
-    systems: List,
+    levels: Array(Level),
+    alloc: Allocator,
 
-    pub fn deinit(self: *@This(), alloc: Allocator) void {
-        var next: ?*System = .fromOpt(self.systems.first);
-        while (next) |system| {
-            next = system.next();
-            system.nexts.deinit(alloc);
-            alloc.destroy(system);
+    pub fn deinit(self: *@This()) void {
+        for (self.levels.items) |*level| {
+            for (level.systems.items) |system|
+                self.alloc.destroy(system);
+
+            level.systems.deinit(self.alloc);
         }
+
+        self.levels.deinit(self.alloc);
     }
+
+    // Reset between uses
+    pub fn reset(self: *@This(), thread_count: usize) void {
+        for (self.levels.items) |*level|
+            level.remaining = .init(thread_count);
+    }
+
+    pub fn iter(self: *@This()) Iterator {
+        return .init(self);
+    }
+
+    pub const Iterator = struct {
+        levels: []Level,
+        level_i: Atomic(usize),
+        system_i: Atomic(usize),
+
+        pub fn init(graph: *CompiledGraph) @This() {
+            return .{
+                .levels = graph.levels.items,
+                .level_i = .init(0),
+                .system_i = .init(0),
+            };
+        }
+
+        // TODO: Assert at least one system in init?
+        pub fn get(self: *@This()) *System {
+            const level_i = self.level_i.load(.monotonic);
+            const system_i = self.system_i.load(.monotonic);
+            return self.levels[level_i].systems.items[system_i];
+        }
+
+        // TODO
+        pub fn next(self: *@This()) ?*System {
+            _ = self;
+            return null;
+        }
+    };
 };
 
 const Worker = struct {
-    chunks: AtomicDeque = .empty,
+    chunks: Queue = .empty,
 
     pub fn run(self: *@This(), scheduler: *Self) void {
-        _ = self;
-        _ = scheduler;
+        var system = scheduler.systems.get();
+        main: while (true) {
+            // Run all chunks in archetype
+            while (self.chunks.pop()) |node|
+                system.runChunk(.from(node));
+
+            // Get next archetype
+            // TODO: refactor into fn
+            const archs = &scheduler.ecs.archetypes;
+            while (true) {
+                const arch_i = scheduler.arch.fetchAdd(1, .monotonic);
+                if (arch_i >= archs.count()) break;
+
+                const arch = archs.values()[arch_i];
+                if (arch.mask.supersetOf(system.rw.toMask())) {
+                    // Found a matching archetype, update chunks and retry
+                    self.chunks.set(arch.chunks);
+                    continue :main;
+                }
+            }
+
+            // No more archetypes to try, get next system
+            system = scheduler.systems.next() orelse break :main;
+            // system = scheduler.system.load(.acquire);
+            // var next_system = system.next() orelse break :main;
+            // while (scheduler.system.cmpxchgWeak(system, next_system, .release, .monotonic)) |new_system| {
+            //     next_system = new_system.next() orelse break :main;
+            // }
+
+            // Spin wait until system ready
+            // var prev_count = system.prev_count.load(.monotonic);
+            // while (prev_count == 0)
+            //     prev_count = system.prev_count.load(.monotonic);
+
+            // TODO: Work stealing opportunity?
+
+            // Load next archetype
+
+        }
+
+        // Try to work steal
+        // Done
     }
 };
 
@@ -356,7 +400,8 @@ pub const Options = struct {
 pub fn init(ecs: *World, opts: Options) Self {
     return .{
         .ecs = ecs,
-        .system = undefined,
+        .systems = undefined,
+        .arch = .init(0),
         .workers = &.{},
         .alloc = opts.alloc orelse ecs.alloc,
     };
@@ -368,15 +413,15 @@ pub fn createGraph(self: *const Self) Graph {
     return .init(self.alloc);
 }
 
-pub fn run(self: *Self, graph: CompiledGraph) !void {
+pub fn run(self: *Self, graph: *CompiledGraph) !void {
     const thread_count = Thread.getCpuCount()
         catch return self.runSingleThreaded();
     var threads = try self.alloc.alloc(Thread, thread_count);
     var workers = try self.alloc.alloc(Worker, thread_count);
     defer self.alloc.free(threads);
 
-    // TODO: Error handling instead of .?
-    self.system = .init(.from(graph.systems.first.?));
+    graph.reset(thread_count);
+    self.systems = .init(graph);
 
     for (0..thread_count) |i| {
         workers[i] = .{};
@@ -466,29 +511,10 @@ fn setup() !World {
     return ecs;
 }
 
-fn expectOrder(expected: []const *const System, graph: *const CompiledGraph) !void {
-    var next: ?*System = .fromOpt(graph.systems.first);
-    var actual: Array(*const System) = .empty;
-    defer actual.deinit(testing.allocator);
-
-    while (next) |system| : (next = system.next())
-        try actual.append(testing.allocator, system);
-
-    errdefer {
-        for (actual.items) |system| {
-            std.debug.print("{s}: &.{{ .read = {}, .write = {} }}, &.{{\n", .{ system.name, system.rw.read.mask, system.rw.write.mask });
-            for (system.nexts.items) |next_system|
-                std.debug.print("    {s}: &.{{ .read = {}, .write = {} }},\n", .{ next_system.name, next_system.rw.read.mask, next_system.rw.write.mask });
-            std.debug.print("}}\n", .{});
-        }
-    }
-
-    try expectEqualSlices(*const System, expected, actual.items);
-}
-
-fn expectLevels(expected: []const []const *const System, graph: *const Graph) !void {
+fn expectLevels(expected: []const []const *const System, graph: *const CompiledGraph) !void {
     errdefer {
         var lookup: [rtti.num_comps][]const u8 = @splat("");
+        // This is kind of a hack, but oh well. I guess I could at least do it for every type in tests?
         inline for (&.{ tests.Position, tests.Velocity, tests.Acceleration }) |T|
             lookup[rtti.typeId(T)] = @typeName(T);
 
@@ -536,12 +562,8 @@ fn expectLevels(expected: []const []const *const System, graph: *const Graph) !v
     if (expected.len != graph.levels.items.len)
         return error.DifferentColLengths;
 
-    for (graph.levels.items, 0..) |*level, i| {
-        // Prematurely sort to test ordering
-        level.sort();
-
+    for (graph.levels.items, 0..) |*level, i|
         try expectEqualSlices(*const System, expected[i], level.systems.items);
-    }
 }
 
 test "simple graph" {
@@ -556,9 +578,12 @@ test "simple graph" {
     const move_sys = try graph.schedule(tests.movement, .{});
     const acc_sys = try graph.schedule(tests.accelerate, .{});
     var compiled = graph.build();
-    defer compiled.deinit(scheduler.alloc);
+    defer compiled.deinit();
 
-    try expectOrder(&.{ move_sys, acc_sys }, &compiled);
+    try expectLevels(&.{
+        &.{ move_sys },
+        &.{ acc_sys },
+    }, &compiled);
 }
 
 test "complex graph" {
@@ -571,24 +596,16 @@ test "complex graph" {
     var graph: Graph = scheduler.createGraph();
     errdefer graph.deinit();
 
-    const move_sys = try graph.scheduleOpts(tests.movement, .{}, .{ .name = "movement" });
-    const acc_sys = try graph.scheduleOpts(tests.accelerate, .{}, .{ .name = "acceleration" });
-    const norm_pos_sys = try graph.scheduleOpts(tests.normalizePos, .{}, .{
-        .name = "normalize_position",
-        .before = &.{move_sys},
-    });
-    const norm_vel_sys = try graph.scheduleOpts(tests.normalizeVel, .{}, .{
-        .name = "normalize_velocity",
-        .before = &.{acc_sys},
-    });
+    const move_sys = try graph.schedule(tests.movement, .{});
+    const acc_sys = try graph.schedule(tests.accelerate, .{});
+    const norm_pos_sys = try graph.scheduleAfter(tests.normalizePos, .{}, &.{move_sys});
+    const norm_vel_sys = try graph.scheduleAfter(tests.normalizeVel, .{}, &.{acc_sys});
+    var compiled = graph.build();
+    defer compiled.deinit();
+
     try expectLevels(&.{
         &.{ move_sys },
         &.{ acc_sys, norm_pos_sys },
         &.{ norm_vel_sys },
-    }, &graph);
-
-    var compiled = graph.build();
-    defer compiled.deinit(scheduler.alloc);
-
-    try expectOrder(&.{ move_sys, acc_sys, norm_pos_sys, norm_vel_sys }, &compiled);
+    }, &compiled);
 }
